@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/Business/" />
+  <Folder Name="/Common/">
+    <Project Path="AvailableVerificationAlgorithms/AvailableVerificationAlgorithms.csproj" />
+    <Project Path="CommunicationExtensions/CommunicationExtensions.csproj" />
+    <Project Path="InfraExtensions.Tests/InfraExtensions.Tests.csproj" />
+    <Project Path="InfraExtensions/InfraExtensions.csproj" />
+    <Project Path="Logger.wpf/Logger.wpf.csproj" />
+    <Project Path="Logger/Logger.csproj" />
+    <Project Path="SerialPortService/SerialPortService.csproj" />
+  </Folder>
+  <Folder Name="/Presentation/">
+    <Project Path="Test-High-speed acquisition/Test-High-speed acquisition.csproj" Id="94709311-660c-437a-94de-8d3167150bd8" />
+  </Folder>
+  <Folder Name="/Services/">
+    <Project Path="Test-High-speed/Test-High-speed.csproj" Id="eddb30a0-def8-494d-8cd4-1527ab203e9c" />
+  </Folder>
+</Solution>

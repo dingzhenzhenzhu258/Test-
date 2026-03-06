@@ -1,0 +1,75 @@
+using System.Threading.Channels;
+
+namespace SerialPortService.Services.Handler
+{
+    /// <summary>
+    /// <see cref="GenericHandler{T}"/> 运行参数。
+    /// 该配置用于控制响应通道容量、日志采样、空闲丢弃策略与重连策略。
+    /// 建议通过 <c>appsettings.json</c> 下发，避免现场硬编码。
+    /// </summary>
+    public sealed class GenericHandlerOptions
+    {
+        /// <summary>
+        /// 响应通道容量。
+        /// 容量越大越能抗突发，但会增加内存占用。
+        /// </summary>
+        public int ResponseChannelCapacity { get; init; } = 512;
+
+        /// <summary>
+        /// 采样日志间隔。
+        /// 例如为 200 时，每 200 次事件记录 1 条日志，避免日志风暴。
+        /// </summary>
+        public int SampleLogInterval { get; init; } = 200;
+
+        /// <summary>
+        /// 当没有活跃请求时是否丢弃解析结果。
+        /// 请求-响应型协议建议开启，以降低无效积压。
+        /// </summary>
+        public bool DropWhenNoActiveRequest { get; init; } = true;
+
+        /// <summary>
+        /// 响应通道满载行为。
+        /// 常用值：<see cref="BoundedChannelFullMode.Wait"/>、<see cref="BoundedChannelFullMode.DropOldest"/>。
+        /// </summary>
+        public BoundedChannelFullMode ResponseChannelFullMode { get; init; } = BoundedChannelFullMode.Wait;
+
+        /// <summary>
+        /// 指标标签：协议名称。
+        /// 若为空，会自动回退到解析器类型名。
+        /// </summary>
+        public string? ProtocolTag { get; init; }
+
+        /// <summary>
+        /// 指标标签：设备类型。
+        /// 若为空，会自动回退到处理器类型名。
+        /// </summary>
+        public string? DeviceTypeTag { get; init; }
+
+        /// <summary>
+        /// 断线重连间隔（毫秒）。
+        /// </summary>
+        public int ReconnectIntervalMs { get; init; } = 1000;
+
+        /// <summary>
+        /// 单次异常场景下的最大重连尝试次数。
+        /// </summary>
+        public int MaxReconnectAttempts { get; init; } = 3;
+    }
+
+    /// <summary>
+    /// 通用处理器指标快照。
+    /// 可用于周期上报、看板展示与告警阈值计算。
+    /// </summary>
+    public readonly record struct GenericHandlerMetrics(
+        long IdleDropped,
+        long OverflowDropped,
+        long Unmatched,
+        long RetryCount,
+        long TimeoutCount,
+        long MatchedCount,
+        long TotalLatencyMs,
+        int ActiveRequests)
+    {
+        public double AverageLatencyMs => MatchedCount == 0 ? 0 : (double)TotalLatencyMs / MatchedCount;
+    }
+}

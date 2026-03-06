@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>Test_High_speed_acquisition</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+		<PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.3" />
+		<PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.3" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.3" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.3" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+		<PackageReference Include="WPF-UI" Version="4.2.0" />
+		<PackageReference Include="WPF-UI.Abstractions" Version="4.2.0" />
+		<PackageReference Include="WPF-UI.DependencyInjection" Version="4.2.0" />
+		<PackageReference Include="WPF-UI.Tray" Version="4.2.0" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <Folder Include="Models\" />
+	  <Folder Include="ViewModels\Pages\" />
+	  <Folder Include="Views\Pages\" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <ProjectReference Include="..\Logger.wpf\Logger.wpf.csproj" />
+	  <ProjectReference Include="..\SerialPortService\SerialPortService.csproj" />
+	</ItemGroup>
+
+</Project>
