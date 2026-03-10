@@ -3,12 +3,15 @@ using CommunityToolkit.Mvvm.Input;
 using SerialPortService.Helpers;
 using SerialPortService.Models.Emuns;
 using SerialPortService.Services.Interfaces;
+using System.Diagnostics;
 using System.Collections.ObjectModel;
 using System.IO.Ports;
 using System.Text;
 using System.Threading.Channels;
 using System.Windows.Threading;
 using Test_High_speed_acquisition.ViewModels.Models;
+using Microsoft.Extensions.Logging;
+using Logger.Helpers;
 
 namespace Test_High_speed_acquisition.ViewModels.Windows
 {
@@ -17,6 +20,8 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
     /// </summary>
     public partial class MainWindowViewModel : ViewModel
     {
+        private const int UiFlushIntervalMs = 2000;
+        private const int MinPollIntervalMs = 20;
         private readonly ISerialPortService _serialPortService;
         private readonly Dispatcher _dispatcher;
         private CancellationTokenSource? _acquisitionCts;
@@ -25,13 +30,15 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         private IModbusContext? _modbusContext;
         private readonly Channel<string> _uiLines;
         private readonly DispatcherTimer _uiFlushTimer;
+        private readonly StringBuilder _receivedDataBuffer = new(130_000);
         private long _totalSendCount;
         private long _totalReceiveCount;
         private long _segmentSendCount;
         private long _segmentReceiveCount;
         private int _segmentIndex;
+        private readonly ILogger<MainWindowViewModel> _logger;
 
-        public MainWindowViewModel(ISerialPortService serialPortService, Dispatcher dispatcher)
+        public MainWindowViewModel(ISerialPortService serialPortService, Dispatcher dispatcher, ILogger<MainWindowViewModel> logger)
         {
             _serialPortService = serialPortService;
             _dispatcher = dispatcher;
@@ -43,9 +50,11 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 SingleReader = true
             });
 
+            _logger = logger;
+
             _uiFlushTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher)
             {
-                Interval = TimeSpan.FromMilliseconds(100)
+                Interval = TimeSpan.FromMilliseconds(UiFlushIntervalMs)
             };
             _uiFlushTimer.Tick += OnUiFlushTimerTick;
             _uiFlushTimer.Start();
@@ -153,6 +162,12 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 PollIntervalMs = 0;
             }
 
+            if (PollIntervalMs < MinPollIntervalMs)
+            {
+                PollIntervalMs = MinPollIntervalMs;
+                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] WARN: 轮询间隔过小，已自动调整为 {MinPollIntervalMs}ms");
+            }
+
             if (!ValidateCommandParameters(out var validationMessage))
             {
                 StatusMessage = validationMessage;
@@ -196,8 +211,11 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             }
 
             var result = _serialPortService.ClosePort(SelectedPort);
-            _modbusContext = null;
-            IsPortOpened = false;
+            if (result.IsSuccess)
+            {
+                _modbusContext = null;
+                IsPortOpened = false;
+            }
             StatusMessage = result.Message ?? string.Empty;
         }
 
@@ -221,6 +239,12 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 PollIntervalMs = 0;
             }
 
+            if (PollIntervalMs < MinPollIntervalMs)
+            {
+                PollIntervalMs = MinPollIntervalMs;
+                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] WARN: 轮询间隔过小，已自动调整为 {MinPollIntervalMs}ms");
+            }
+
             if (!ValidateCommandParameters(out var validationMessage))
             {
                 StatusMessage = validationMessage;
@@ -232,8 +256,8 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             _segmentIndex++;
 
             _acquisitionCts = new CancellationTokenSource();
-            _sendLoopTask = Task.Run(() => SendLoopAsync(SelectedPort, _acquisitionCts.Token));
-            _receiveLoopTask = Task.Run(() => ReceiveLoopAsync(_modbusContext, _acquisitionCts.Token));
+            _sendLoopTask = Task.Run(() => SendLoopAsync(_modbusContext, _acquisitionCts.Token));
+            _receiveLoopTask = null;
 
             IsAcquiring = true;
             _uiLines.Writer.TryWrite($"===== 第{_segmentIndex}段开始 =====");
@@ -263,10 +287,17 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
 
                 try
                 {
-                    await Task.WhenAll(tasks);
+                    // 步骤1：等待发送任务有序退出，并设置超时上限。
+                    // 为什么：避免串口异常场景下关闭流程无限等待。
+                    // 风险点：无超时兜底会导致停止采集或关窗卡死。
+                    await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(3));
                 }
                 catch (OperationCanceledException)
                 {
+                }
+                catch (TimeoutException)
+                {
+                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] STOP-WARN: 等待采集任务退出超时，继续执行关闭流程");
                 }
                 catch
                 {
@@ -289,58 +320,88 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         [RelayCommand]
         private void ClearReceivedData()
         {
+            _receivedDataBuffer.Clear();
             ReceivedData = string.Empty;
         }
 
         /// <summary>
         /// 窗口关闭前执行清理，确保串口和事件订阅正确释放。
         /// </summary>
-        public void Cleanup()
+        public async Task CleanupAsync()
         {
+            // 步骤1：优先停止采集任务。
+            // 为什么：先停发送循环可降低关窗阶段的并发冲突。
+            // 风险点：采集未停就关串口，可能触发发送异常或等待卡顿。
             if (IsAcquiring)
             {
-                StopAcquisitionAsync().GetAwaiter().GetResult();
+                await StopAcquisitionAsync();
             }
 
+            // 步骤2：关闭已打开串口。
+            // 为什么：释放串口句柄，避免下次启动占用失败。
+            // 风险点：不关闭串口会导致端口残留占用。
             if (IsPortOpened)
             {
-                ClosePortAsync().GetAwaiter().GetResult();
+                await ClosePortAsync();
             }
 
+            // 步骤3：停止 UI 刷新计时器并解绑事件。
+            // 为什么：防止窗口销毁后仍触发 UI 回调。
+            // 风险点：未解绑事件可能导致内存泄漏或对象已释放异常。
             _uiFlushTimer.Stop();
             _uiFlushTimer.Tick -= OnUiFlushTimerTick;
         }
 
         /// <summary>
-        /// 高速发送线程：持续发送 Modbus 读命令。
+        /// 同步轮询发送线程：每次请求等待匹配响应后再发下一次。
         /// </summary>
-        private async Task SendLoopAsync(string portName, CancellationToken cancellationToken)
+        private async Task SendLoopAsync(IModbusContext modbus, CancellationToken cancellationToken)
         {
             while (!cancellationToken.IsCancellationRequested)
             {
+                // 步骤1：记录本轮开始时间。
+                // 为什么：用于实现“任意 ms 配置”的精确轮询节奏。
+                // 风险点：仅使用固定 Delay 会叠加处理时间，实际周期会漂移。
+                var cycleWatch = Stopwatch.StartNew();
+
+                // 步骤2：构建并发送读取命令。
+                // 为什么：统一走 Modbus 请求-响应闭环，避免高频盲发。
+                // 风险点：若并行发送或不等响应，易出现回包串台与丢包。
                 var command = BuildReadCommand();
-                await _serialPortService.Write(portName, command).ConfigureAwait(false);
+                var txHex = BitConverter.ToString(command);
                 Interlocked.Increment(ref _totalSendCount);
                 Interlocked.Increment(ref _segmentSendCount);
-                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX: {BitConverter.ToString(command)}");
-
-                if (PollIntervalMs > 0)
+                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX: {txHex}");
+                _logger.AddLog(LogLevel.Information, "发送命令: {Command}", args: new object[] { txHex });
+                try
                 {
-                    await Task.Delay(PollIntervalMs, cancellationToken).ConfigureAwait(false);
+                    // 步骤3：等待匹配响应（同步轮询核心）。
+                    // 为什么：确保一问一答，杜绝 20ms 高频下的“只发不收”。
+                    // 风险点：超时参数过小会频繁超时，过大则降低吞吐。
+                    var packet = await modbus.SendRequestAsync(command, timeout: 3000, retryCount: 1, cancellationToken).ConfigureAwait(false);
+                    var index = Interlocked.Increment(ref _totalReceiveCount);
+                    Interlocked.Increment(ref _segmentReceiveCount);
+                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] #{index} RX: {BitConverter.ToString(packet.RawFrame)}");
+                    _logger.AddLog(LogLevel.Information, "接收响应: {Response}", args: new object[] { BitConverter.ToString(packet.RawFrame) });
                 }
-            }
-        }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
+                }
 
-        /// <summary>
-        /// 高速接收线程：持续读取已解析的 Modbus 报文。
-        /// </summary>
-        private async Task ReceiveLoopAsync(IModbusContext modbus, CancellationToken cancellationToken)
-        {
-            await foreach (var packet in modbus.ReadParsedPacketsAsync(cancellationToken).ConfigureAwait(false))
-            {
-                var index = Interlocked.Increment(ref _totalReceiveCount);
-                Interlocked.Increment(ref _segmentReceiveCount);
-                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] #{index} RX: {BitConverter.ToString(packet.RawFrame)}");
+                // 步骤4：按配置补齐剩余周期，支持任意 ms（含 0ms）。
+                // 为什么：当响应快于周期时保持固定节奏；响应慢于周期时立即下一轮。
+                // 风险点：不扣除处理耗时会导致实际周期 > 配置值。
+                cycleWatch.Stop();
+                var remainingMs = PollIntervalMs - (int)cycleWatch.ElapsedMilliseconds;
+                if (remainingMs > 0)
+                {
+                    await Task.Delay(remainingMs, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
 
@@ -416,20 +477,23 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             }
 
             var sb = new StringBuilder();
-            var count = 0;
-            while (count < 200 && _uiLines.Reader.TryRead(out var line))
+            while (_uiLines.Reader.TryRead(out var line))
             {
                 sb.AppendLine(line);
-                count++;
             }
 
-            ReceivedData += sb.ToString();
+            if (sb.Length > 0)
+            {
+                _receivedDataBuffer.Append(sb);
+            }
 
             const int maxChars = 120_000;
-            if (ReceivedData.Length > maxChars)
+            if (_receivedDataBuffer.Length > maxChars)
             {
-                ReceivedData = ReceivedData[^maxChars..];
+                _receivedDataBuffer.Remove(0, _receivedDataBuffer.Length - maxChars);
             }
+
+            ReceivedData = _receivedDataBuffer.ToString();
 
             UpdateStatusMessage();
         }

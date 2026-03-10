@@ -68,3 +68,57 @@ var result = service.OpenPort("COM3", 9600, Parity.None, 8, StopBits.One, Handle
 - `serialport.handler.timeout_count`
 - `serialport.handler.wait_backlog`
 - `Reconnect failure-rate alert` 日志
+
+---
+
+## 解析报文消费示例
+
+下面示例展示如何在 README 中快速使用 `ReadParsedPacketsAsync`、事件订阅和覆写 `OnParsed` 三种消费方式（详见 `docs/SerialPortService-API-Usage.md`）。
+
+1) 异步流消费（适合高吞吐）
+
+```csharp
+// 假设已通过 service.OpenPort(...) 得到 modbusHandler: ModbusHandler
+var cts = new CancellationTokenSource();
+_ = Task.Run(async () =>
+{
+    try
+    {
+        await foreach (var pkt in modbusHandler.ReadParsedPacketsAsync(cts.Token))
+        {
+            // 异步持久化或转发
+            _ = Task.Run(() => PersistPacketAsync(pkt));
+        }
+    }
+    catch (OperationCanceledException) { }
+});
+
+// 取消示例
+// cts.Cancel();
+```
+
+2) 事件订阅（适合 UI / 轻量通知）
+
+```csharp
+modbusContext.OnHandleChanged += (sender, e) =>
+{
+    var result = (OperateResult<ModbusPacket>)e;
+    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Result));
+};
+```
+
+3) 覆写 `OnParsed`（适合协议内部高性能处理）
+
+```csharp
+public class MyHandler : GenericHandler<ModbusPacket>
+{
+    protected override void OnParsed(ModbusPacket pkt)
+    {
+        base.OnParsed(pkt); // 保留分发与统计
+        // 直接内存聚合或发送到高性能队列，不要阻塞
+        _localQueue.Enqueue(pkt);
+    }
+}
+```
+
+更多细节与注意事项请参见 `docs/SerialPortService-API-Usage.md`。

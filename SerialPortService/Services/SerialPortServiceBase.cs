@@ -345,24 +345,61 @@ namespace SerialPortService.Services
         /// <returns></returns>
         public OperateResult ClosePort(string portName)
         {
+            IPortContext? context;
+            PortBinding? bindingSnapshot = null;
             lock (portOpenCloseLock)
             {
                 // 步骤1：先移除字典项再关闭。
                 // 为什么：先摘除可阻止并发发送拿到即将关闭的上下文。
                 // 风险点：若先关闭再移除，可能出现并发“写到关闭中的端口”。
-                if (!ports.TryRemove(portName, out var context))
+                if (!ports.TryRemove(portName, out context))
                     return new OperateResult(false, $"未找到串口 {portName}", -1);
 
                 // 步骤2：清理绑定快照。
                 // 为什么：关闭后应允许按新参数重新打开同名端口。
                 // 风险点：不清理会导致后续重开误判参数冲突。
+                if (portBindings.TryGetValue(portName, out var binding))
+                {
+                    bindingSnapshot = binding;
+                }
                 portBindings.TryRemove(portName, out _);
 
-                // 步骤3：执行关闭与释放。
-                // 为什么：释放串口句柄与后台任务，避免资源泄漏。
-                // 风险点：未释放会导致端口占用、重开失败或句柄泄漏。
-                context.Close();
+            }
+
+            // 步骤3：在锁外执行关闭与释放。
+            // 为什么：避免关闭过程阻塞全局端口开关锁，降低“超时场景关窗卡死”概率。
+            // 风险点：若在锁内执行耗时 IO，可能造成其他端口操作长期等待。
+            try
+            {
+                context!.Close();
                 context.Dispose();
+            }
+            catch (Exception ex)
+            {
+                lock (portOpenCloseLock)
+                {
+                    ports.TryAdd(portName, context!);
+                    if (bindingSnapshot.HasValue)
+                    {
+                        portBindings.TryAdd(portName, bindingSnapshot.Value);
+                    }
+                }
+
+                return new OperateResult(false, $"{portName} 关闭失败: {ex.Message}", -1);
+            }
+
+            if (!context!.LastCloseSucceeded)
+            {
+                lock (portOpenCloseLock)
+                {
+                    ports.TryAdd(portName, context);
+                    if (bindingSnapshot.HasValue)
+                    {
+                        portBindings.TryAdd(portName, bindingSnapshot.Value);
+                    }
+                }
+
+                return new OperateResult(false, $"{portName} 关闭未完成：底层串口句柄可能仍被占用", -1);
             }
 
             return new OperateResult(true, $"{portName} 关闭成功", 0);
@@ -373,13 +410,14 @@ namespace SerialPortService.Services
         /// </summary>
         public OperateResult CloseAll()
         {
+            List<(string PortName, IPortContext Context)> contextsToClose;
             lock (portOpenCloseLock)
             {
                 // 步骤1：快照当前端口并逐个关闭。
                 // 为什么：避免遍历期间字典变化影响关闭流程。
                 // 风险点：并发修改时若无快照，可能遗漏或重复关闭。
                 var portNames = ports.Keys.ToList();
-                var errors = new List<string>();
+                contextsToClose = new List<(string PortName, IPortContext Context)>(portNames.Count);
 
                 foreach (var portName in portNames)
                 {
@@ -391,22 +429,33 @@ namespace SerialPortService.Services
                     // 风险点：状态不一致会影响后续 IsOpen/OpenPort 判断。
                     portBindings.TryRemove(portName, out _);
 
-                    try
-                    {
-                        context.Close();
-                        context.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        errors.Add($"{portName}:{ex.Message}");
-                    }
+                    contextsToClose.Add((portName, context));
                 }
 
-                if (errors.Count > 0)
-                    return new OperateResult(false, $"部分关闭失败: {string.Join("; ", errors)}", -1);
+                if (contextsToClose.Count == 0)
+                    return new OperateResult(true, "关闭完成: 0", 0);
 
-                return new OperateResult(true, $"关闭完成: {portNames.Count}", 0);
+                // 锁内仅完成状态摘除，实际关闭在锁外执行。
             }
+
+            var errors = new List<string>();
+            foreach (var (portName, context) in contextsToClose)
+            {
+                try
+                {
+                    context.Close();
+                    context.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{portName}:{ex.Message}");
+                }
+            }
+
+            if (errors.Count > 0)
+                return new OperateResult(false, $"部分关闭失败: {string.Join("; ", errors)}", -1);
+
+            return new OperateResult(true, $"关闭完成: {contextsToClose.Count}", 0);
         }
 
         /// <summary>

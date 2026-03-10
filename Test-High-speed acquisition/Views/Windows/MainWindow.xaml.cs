@@ -13,14 +13,17 @@ namespace Test_High_speed_acquisition.Views.Windows
         public MainWindow()
         {
             InitializeComponent();
-            Closed += OnClosed;
+            Closed += OnClosedAsync;
         }
 
-        private void OnClosed(object? sender, EventArgs e)
+        private async void OnClosedAsync(object? sender, EventArgs e)
         {
             if (DataContext is MainWindowViewModel vm)
             {
-                vm.Cleanup();
+                // 步骤1：异步执行清理，避免 UI 线程同步阻塞。
+                // 为什么：关窗阶段若同步等待后台任务，容易出现卡死。
+                // 风险点：不等待清理会遗留串口占用与计时器回调。
+                await vm.CleanupAsync();
             }
         }
 

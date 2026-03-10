@@ -1,7 +1,4 @@
 ﻿﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace SerialPortService.Services.Interfaces
@@ -26,6 +23,11 @@ namespace SerialPortService.Services.Interfaces
         /// 关闭串口并停止处理流水线。
         /// </summary>
         void Close();
+
+        /// <summary>
+        /// 最近一次关闭流程是否完整成功。
+        /// </summary>
+        bool LastCloseSucceeded { get; }
 
         /// <summary>
         /// 发送原始数据。

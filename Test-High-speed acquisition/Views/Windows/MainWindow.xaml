@@ -219,6 +219,8 @@
                      AcceptsReturn="True"
                      TextWrapping="NoWrap"
                      IsReadOnly="True"
+                     IsUndoEnabled="False"
+                     UndoLimit="0"
                      Foreground="#F3F3F3"
                      Background="#141414"
                      BorderBrush="#3A3A3A"

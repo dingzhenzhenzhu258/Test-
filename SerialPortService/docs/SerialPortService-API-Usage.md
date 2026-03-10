@@ -34,3 +34,51 @@
 1. 优先走 `TryWrite`。
 2. 失败时记录业务日志 + 设备标识 + 指令摘要。
 3. 按业务策略执行限次重试和人工告警。
+
+## 解析报文消费示例
+
+下面示例展示三种常见的解析后消费方式：
+
+1) 异步流消费（推荐用于高吞吐/可取消场景）
+
+```csharp
+// 在业务线程中持续消费解析完成的报文
+var cts = new CancellationTokenSource();
+try
+{
+    await foreach (var pkt in modbusHandler.ReadParsedPacketsAsync(cts.Token))
+    {
+        // 异步写入数据库或队列（避免阻塞解析线程）
+        _ = Task.Run(() => PersistPacketAsync(pkt));
+    }
+}
+catch (OperationCanceledException) { }
+```
+
+2) 事件订阅（轻量，同步通知）
+
+```csharp
+modbusContext.OnHandleChanged += (sender, e) =>
+{
+    var result = (OperateResult<ModbusPacket>)e;
+    // UI 线程需调度
+    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Result));
+};
+```
+
+3) 在 Handler 内部高性能处理（覆写 Hook）
+
+```csharp
+// 在自定义 Handler 中覆写
+protected override void OnParsed(ModbusPacket pkt)
+{
+    base.OnParsed(pkt); // 保留基类分发与统计
+    // 直接内存写入或聚合（注意不要阻塞）
+    _localAggregator.Add(pkt);
+}
+```
+
+要点：
+- 若使用 `ReadParsedPacketsAsync`，请传入 `CancellationToken` 并确保消费者能跟上生产速率；否者可能触发通道丢包（默认是 DropOldest）。
+- `OnHandleChanged` 回调可能在解析线程触发；若在 UI 使用需切换线程上下文。
+- 覆写 `OnParsed` 为最高性能路径，但不应做阻塞操作。

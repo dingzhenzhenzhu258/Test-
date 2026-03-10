@@ -13,9 +13,12 @@ namespace SerialPortService.Services.Protocols.Modbus
     /// </summary>
     public class ModbusRtuParser : IStreamParser<ModbusPacket>
     {
+        private const int FrameAssembleGapMs = 50;
+
         // 固定缓冲区
         private readonly byte[] _buffer = new byte[512];
         private int _count = 0;
+        private long _lastByteTickMs;
 
         // 功能码处理器字典
         private readonly Dictionary<byte, ModbusFunction> _functions;
@@ -100,6 +103,20 @@ namespace SerialPortService.Services.Protocols.Modbus
 
         private void ParseByte(byte b, List<ModbusPacket> output)
         {
+            var nowTickMs = Environment.TickCount64;
+
+            // 步骤1：检测帧内字节间隔是否异常。
+            // 为什么：若中途丢字节导致长时间断流，应尽快重置状态机恢复同步。
+            // 风险点：不做间隔复位可能长期等待错误长度，触发连续请求超时。
+            if (_state != FrameParseState.WaitAddress
+                && _lastByteTickMs > 0
+                && nowTickMs - _lastByteTickMs > FrameAssembleGapMs)
+            {
+                Reset();
+            }
+
+            _lastByteTickMs = nowTickMs;
+
             // 步骤1：写入接收缓冲区。
             // 为什么：状态机需要保留当前候选帧的原始字节。
             // 风险点：缓冲区溢出若不处理会触发越界异常。
@@ -122,6 +139,15 @@ namespace SerialPortService.Services.Protocols.Modbus
             switch (_state)
             {
                 case FrameParseState.WaitAddress:
+                    // 步骤2.0：先校验站号范围。
+                    // 为什么：Modbus 从站地址有效范围通常为 1~247，过滤噪声可减少假帧进入状态机。
+                    // 风险点：若允许任意字节作为地址，噪声会放大错帧概率并触发后续超时。
+                    if (b is < 1 or > 247)
+                    {
+                        Reset();
+                        break;
+                    }
+
                     _state = FrameParseState.WaitFuncCode;
                     break;
 
@@ -201,6 +227,15 @@ namespace SerialPortService.Services.Protocols.Modbus
                             // 有些协议 (如0x44) HeaderLength=5, Value=N. Total = 5+N.
                             // 所以公式是通用的。
                             _expectedDataLen = _currentFunction.HeaderLength + lengthVal;
+
+                            // 步骤2.4.3：对变长数据区长度做上限保护。
+                            // 为什么：噪声字节可能把长度字段污染成异常值，导致状态机长时间卡在等待数据。
+                            // 风险点：无长度保护会放大偶发串口抖动，形成连续超时。
+                            var maxDataLen = _buffer.Length - 4;
+                            if (_expectedDataLen <= 0 || _expectedDataLen > maxDataLen)
+                            {
+                                Reset();
+                            }
                         }
                     }
                     
@@ -216,6 +251,12 @@ namespace SerialPortService.Services.Protocols.Modbus
                     // 为什么：仅通过 CRC 的帧才可进入业务处理。
                     // 风险点：跳过 CRC 会把损坏数据交给上层。
                     int totalLen = 2 + _expectedDataLen + 2;
+                    if (totalLen > _buffer.Length)
+                    {
+                        Reset();
+                        break;
+                    }
+
                     if (_count >= totalLen)
                     {
                         if (CheckCrc(_buffer.AsSpan(0, totalLen)))

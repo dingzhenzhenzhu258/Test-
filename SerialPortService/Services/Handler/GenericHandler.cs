@@ -32,6 +32,7 @@ namespace SerialPortService.Services.Handler
 
         // 统一通道模型：有界 + 限流，适配高并发采集
         private readonly Channel<T> _responseChannel;
+        private readonly Channel<T> _parsedPacketChannel;
         private readonly Channel<T>? _waitModeQueue;
         private readonly CancellationTokenSource _disposeCts = new CancellationTokenSource();
         private readonly Task? _waitModeWriterTask;
@@ -46,6 +47,9 @@ namespace SerialPortService.Services.Handler
         private long _totalLatencyMs;
         private long _waitModeQueueLength;
         private long _waitModeQueueHighWatermark;
+        private long _parsedPacketDropCount;
+        private long _lastParsedUtcTicks;
+        private int _consecutiveTimeoutCount;
         private readonly int _metricsRegistrationId;
         private int _disposeSignaled;
         private int _waitBacklogAlertActive;
@@ -84,6 +88,13 @@ namespace SerialPortService.Services.Handler
                 SingleWriter = false
             });
 
+            _parsedPacketChannel = Channel.CreateBounded<T>(new BoundedChannelOptions(_options.ResponseChannelCapacity)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = false,
+                SingleWriter = true
+            });
+
             if (_options.ResponseChannelFullMode == BoundedChannelFullMode.Wait)
             {
                 _waitModeQueue = Channel.CreateBounded<T>(new BoundedChannelOptions(_options.WaitModeQueueCapacity)
@@ -116,6 +127,7 @@ namespace SerialPortService.Services.Handler
             if (Interlocked.Exchange(ref _disposeSignaled, 1) == 0)
             {
                 _responseChannel.Writer.TryComplete();
+                _parsedPacketChannel.Writer.TryComplete();
                 _disposeCts.Cancel();
                 _waitModeQueue?.Writer.TryComplete();
                 try
@@ -168,7 +180,21 @@ namespace SerialPortService.Services.Handler
         {
             if (content == null) return;
 
-            // 步骤1：无活跃请求时按策略丢弃响应。
+            Interlocked.Exchange(ref _lastParsedUtcTicks, DateTime.UtcNow.Ticks);
+
+            // 步骤1：先分发到解析报文流通道。
+            // 为什么：提供通用异步消费入口，便于各协议读取解析结果。
+            // 风险点：消费端跟不上时会触发通道丢弃，需监控丢包计数。
+            if (!_parsedPacketChannel.Writer.TryWrite(content))
+            {
+                var dropped = Interlocked.Increment(ref _parsedPacketDropCount);
+                if (ShouldSample(dropped))
+                {
+                    Logger.AddLog(LogLevel.Warning, string.Concat("[", _handlerName, "] Parsed packet channel dropped count: ", dropped));
+                }
+            }
+
+            // 步骤2：无活跃请求时按策略丢弃响应。
             // 为什么：请求-响应模型下，空闲数据通常是噪声或无效上报。
             // 风险点：若不丢弃，响应通道会被无关数据挤占。
             if (_options.DropWhenNoActiveRequest && Volatile.Read(ref _activeRequests) <= 0)
@@ -181,7 +207,7 @@ namespace SerialPortService.Services.Handler
                 return;
             }
 
-            // 步骤2：尝试入队到响应通道。
+            // 步骤3：尝试入队到响应通道。
             // 为什么：后续匹配逻辑统一从通道读取。
             // 风险点：入队失败若不统计，会掩盖背压瓶颈。
             if (!TryEnqueueResponse(content))
@@ -222,6 +248,13 @@ namespace SerialPortService.Services.Handler
                 Volatile.Read(ref _activeRequests),
                 Interlocked.Read(ref _waitModeQueueLength),
                 Interlocked.Read(ref _waitModeQueueHighWatermark));
+
+        /// <summary>
+        /// 读取解析完成的业务报文流。
+        /// 解析线程产出完整对象后写入通道，业务线程可独立异步消费。
+        /// </summary>
+        public virtual IAsyncEnumerable<T> ReadParsedPacketsAsync(CancellationToken cancellationToken = default)
+            => _parsedPacketChannel.Reader.ReadAllAsync(cancellationToken);
 
         /// <summary>
         /// 发送请求并等待匹配响应（通用核心流程）。
@@ -271,7 +304,9 @@ namespace SerialPortService.Services.Handler
                                 }
 
                                 Interlocked.Increment(ref _timeoutCount);
-                    TryLogTimeoutRateAlert();
+                                await TryAutoRecoverAfterTimeoutAsync(cancellationToken).ConfigureAwait(false);
+                                TryLogTimeoutRateAlert();
+                                Logger.AddLog(LogLevel.Warning, BuildTimeoutDiagnostic(command, i + 1, retryCount + 1, timeout));
                                 throw new TimeoutException($"Request timeout after {retryCount + 1} attempts");
                             }
 
@@ -286,7 +321,9 @@ namespace SerialPortService.Services.Handler
                                 }
 
                                 Interlocked.Increment(ref _timeoutCount);
+                                await TryAutoRecoverAfterTimeoutAsync(cancellationToken).ConfigureAwait(false);
                                 TryLogTimeoutRateAlert();
+                                Logger.AddLog(LogLevel.Warning, BuildTimeoutDiagnostic(command, i + 1, retryCount + 1, timeout));
                                 throw new TimeoutException($"Request timeout after {retryCount + 1} attempts");
                             }
 
@@ -311,6 +348,7 @@ namespace SerialPortService.Services.Handler
                             attemptWatch.Stop();
                             Interlocked.Increment(ref _matchedCount);
                             Interlocked.Add(ref _totalLatencyMs, attemptWatch.ElapsedMilliseconds);
+                            Interlocked.Exchange(ref _consecutiveTimeoutCount, 0);
                             return result;
                         }
 
@@ -319,6 +357,9 @@ namespace SerialPortService.Services.Handler
                         {
                             Logger.AddLog(LogLevel.Warning, string.Concat("[", _handlerName, "] Skipped unmatched packets: ", unmatched, ", Last: ", BuildUnmatchedLog(result)));
                         }
+                        // 诊断：解析成功但未匹配计数（unmatched）已自增并在采样时记录
+                        // 为什么：用于判断响应是否到达但未与请求配对
+                        // 风险点：过度输出会产生噪声，已通过 ShouldSample 控制
                     }
                 }
 
@@ -464,6 +505,35 @@ namespace SerialPortService.Services.Handler
             {
                 Logger.AddLog(LogLevel.Error, $"[{_handlerName}] Wait backlog alert: backlog={backlog}, threshold={threshold}");
             }
+        }
+
+        private string BuildTimeoutDiagnostic(byte[] command, int attempt, int totalAttempts, int timeoutMs)
+        {
+            var matched = Interlocked.Read(ref _matchedCount);
+            var unmatched = Interlocked.Read(ref _unmatchedCount);
+            var idleDropped = Interlocked.Read(ref _idleDroppedCount);
+            var overflowDropped = Interlocked.Read(ref _overflowDroppedCount);
+            var queueBacklog = Interlocked.Read(ref _waitModeQueueLength);
+            var activeRequests = Volatile.Read(ref _activeRequests);
+            var lastParsedTicks = Interlocked.Read(ref _lastParsedUtcTicks);
+            var sinceLastParsedMs = lastParsedTicks > 0
+                ? (long)(DateTime.UtcNow - new DateTime(lastParsedTicks, DateTimeKind.Utc)).TotalMilliseconds
+                : -1;
+
+            return $"[{_handlerName}] Timeout diagnostic: cmd={BitConverter.ToString(command)}, attempt={attempt}/{totalAttempts}, timeoutMs={timeoutMs}, matched={matched}, unmatched={unmatched}, idleDropped={idleDropped}, overflowDropped={overflowDropped}, waitBacklog={queueBacklog}, activeRequests={activeRequests}, sinceLastParsedMs={sinceLastParsedMs}";
+        }
+
+        private async Task TryAutoRecoverAfterTimeoutAsync(CancellationToken cancellationToken)
+        {
+            var consecutive = Interlocked.Increment(ref _consecutiveTimeoutCount);
+            if (consecutive < 3)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref _consecutiveTimeoutCount, 0);
+            Logger.AddLog(LogLevel.Warning, $"[{_handlerName}] Consecutive timeout threshold reached, try force reconnect.");
+            await TryReconnectAsync(cancellationToken, "consecutive request timeout", forceReopen: true).ConfigureAwait(false);
         }
     }
 }
