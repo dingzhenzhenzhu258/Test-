@@ -11,8 +11,15 @@ using System.Threading.Tasks;
 
 namespace SerialPortService.Services.Interfaces
 {
+    /// <summary>
+    /// 串口服务统一入口接口。
+    /// 负责上下文创建、端口管理与发送能力对外暴露。
+    /// </summary>
     public interface ISerialPortService
     {
+        /// <summary>
+        /// 自定义上下文工厂委托。
+        /// </summary>
         public delegate IPortContext PortContextFactory(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, HandleEnum handleEnum, ProtocolEnum protocol, ILoggerFactory loggerFactory);
 
         /// <summary>
@@ -33,12 +40,24 @@ namespace SerialPortService.Services.Interfaces
         /// </summary>
         OperateResult ClosePort(string portName);
 
+        /// <summary>
+        /// 关闭所有已打开串口。
+        /// </summary>
         OperateResult CloseAll();
 
+        /// <summary>
+        /// 获取已打开串口对应上下文。
+        /// </summary>
         bool TryGetContext(string portName, out IPortContext? context);
 
+        /// <summary>
+        /// 注册设备处理器工厂。
+        /// </summary>
         bool RegisterHandlerFactory(HandleEnum handleEnum, PortContextFactory factory);
 
+        /// <summary>
+        /// 设置设备到协议的动态解析器。
+        /// </summary>
         void SetProtocolResolver(Func<HandleEnum, ProtocolEnum> resolver);
 
         /// <summary>
@@ -55,5 +74,7 @@ namespace SerialPortService.Services.Interfaces
         bool IsOpen(string portName);
 
         Task<byte[]> Write(string portName, byte[] data);
+
+        Task<OperateResult<byte[]>> TryWrite(string portName, byte[] data);
     }
 }

@@ -9,6 +9,8 @@ namespace SerialPortService.Services
     {
         private static int _reconnectIntervalMs = 1000;
         private static int _maxReconnectAttempts = 3;
+        private static int _reconnectFailureRateAlertThresholdPercent = 30;
+        private static int _reconnectFailureRateAlertMinSamples = 20;
 
         /// <summary>
         /// 重连间隔（毫秒）。
@@ -21,19 +23,52 @@ namespace SerialPortService.Services
         public static int MaxReconnectAttempts => Volatile.Read(ref _maxReconnectAttempts);
 
         /// <summary>
-        /// 更新重连策略。
-        /// 仅当输入值大于 0 时生效。
+        /// 重连失败率告警阈值（百分比）。
         /// </summary>
-        public static void Configure(int reconnectIntervalMs, int maxReconnectAttempts)
+        public static int ReconnectFailureRateAlertThresholdPercent => Volatile.Read(ref _reconnectFailureRateAlertThresholdPercent);
+
+        /// <summary>
+        /// 重连失败率告警最小样本数。
+        /// </summary>
+        public static int ReconnectFailureRateAlertMinSamples => Volatile.Read(ref _reconnectFailureRateAlertMinSamples);
+
+        /// <summary>
+        /// 更新重连策略。
+        /// 时间/次数类参数仅当输入值大于 0 时生效；
+        /// 失败率阈值支持 0~100（0 表示关闭该类告警）。
+        /// </summary>
+        public static void Configure(int reconnectIntervalMs, int maxReconnectAttempts, int reconnectFailureRateAlertThresholdPercent, int reconnectFailureRateAlertMinSamples)
         {
+            // 步骤1：更新重连间隔。
+            // 为什么：为重连退避提供统一节奏。
+            // 风险点：间隔过小会造成重连风暴，过大则恢复变慢。
             if (reconnectIntervalMs > 0)
             {
                 Volatile.Write(ref _reconnectIntervalMs, reconnectIntervalMs);
             }
 
+            // 步骤2：更新最大重连次数。
+            // 为什么：限制单次故障的重试成本。
+            // 风险点：次数过少易误判故障，过多会拖慢失败回退。
             if (maxReconnectAttempts > 0)
             {
                 Volatile.Write(ref _maxReconnectAttempts, maxReconnectAttempts);
+            }
+
+            // 步骤3：更新重连失败率告警阈值。
+            // 为什么：让告警策略可配置并适配不同现场噪声。
+            // 风险点：阈值不合理会导致漏报或告警风暴。
+            if (reconnectFailureRateAlertThresholdPercent is >= 0 and <= 100)
+            {
+                Volatile.Write(ref _reconnectFailureRateAlertThresholdPercent, reconnectFailureRateAlertThresholdPercent);
+            }
+
+            // 步骤4：更新失败率告警最小样本数。
+            // 为什么：降低小样本波动造成的误告警。
+            // 风险点：样本过小导致抖动，过大则告警滞后。
+            if (reconnectFailureRateAlertMinSamples > 0)
+            {
+                Volatile.Write(ref _reconnectFailureRateAlertMinSamples, reconnectFailureRateAlertMinSamples);
             }
         }
     }

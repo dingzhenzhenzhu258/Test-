@@ -34,6 +34,12 @@ namespace SerialPortService.Services.Handler
         public BoundedChannelFullMode ResponseChannelFullMode { get; init; } = BoundedChannelFullMode.Wait;
 
         /// <summary>
+        /// Wait 模式下的背压队列容量。
+        /// 当响应通道暂时不可写时，解析线程会先写入该队列，超过容量后按丢弃处理。
+        /// </summary>
+        public int WaitModeQueueCapacity { get; init; } = 4096;
+
+        /// <summary>
         /// 指标标签：协议名称。
         /// 若为空，会自动回退到解析器类型名。
         /// </summary>
@@ -54,6 +60,35 @@ namespace SerialPortService.Services.Handler
         /// 单次异常场景下的最大重连尝试次数。
         /// </summary>
         public int MaxReconnectAttempts { get; init; } = 3;
+
+        /// <summary>
+        /// 超时率告警阈值（百分比，0-100）。
+        /// 当 timeout/(timeout+matched) 超过该值时触发告警。
+        /// 设为 0 表示关闭。
+        /// </summary>
+        public int TimeoutRateAlertThresholdPercent { get; init; } = 20;
+
+        /// <summary>
+        /// 超时率告警最小样本数。
+        /// </summary>
+        public int TimeoutRateAlertMinSamples { get; init; } = 20;
+
+        /// <summary>
+        /// Wait 模式队列积压告警阈值。
+        /// 当 WaitBacklog 达到该值时触发告警。
+        /// 设为 0 表示关闭。
+        /// </summary>
+        public int WaitBacklogAlertThreshold { get; init; } = 1024;
+
+        /// <summary>
+        /// 重连失败率告警阈值（百分比，0-100）。
+        /// </summary>
+        public int ReconnectFailureRateAlertThresholdPercent { get; init; } = 30;
+
+        /// <summary>
+        /// 重连失败率告警最小样本数。
+        /// </summary>
+        public int ReconnectFailureRateAlertMinSamples { get; init; } = 20;
     }
 
     /// <summary>
@@ -68,7 +103,9 @@ namespace SerialPortService.Services.Handler
         long TimeoutCount,
         long MatchedCount,
         long TotalLatencyMs,
-        int ActiveRequests)
+        int ActiveRequests,
+        long WaitBacklog,
+        long WaitBacklogHighWatermark)
     {
         public double AverageLatencyMs => MatchedCount == 0 ? 0 : (double)TotalLatencyMs / MatchedCount;
     }

@@ -17,17 +17,26 @@ namespace SerialPortService.Services.Parser
 
         public bool TryParse(byte b, [NotNullWhen(true)] out string? result)
         {
+            // 步骤1：默认结果置空。
+            // 为什么：仅在凑齐完整帧后输出业务结果。
+            // 风险点：复用旧值会产生假阳性状态。
             result = null;
 
-            // 简单逻辑：填满6个字节就算一个包
-            // (实际建议加包头判断，防止错位)
+            // 步骤2：按固定 6 字节窗口累积。
+            // 为什么：当前控制器协议为定长帧。
+            // 风险点：无包头校验时遇到乱流可能错位解析。
             _buffer[_index++] = b;
 
             if (_index >= 6)
             {
-                _index = 0; // 重置
+                // 步骤3：凑满一帧后重置索引。
+                // 为什么：准备接收下一帧数据。
+                // 风险点：不重置会造成数组越界。
+                _index = 0;
 
-                // 这里照搬你原来的逻辑
+                // 步骤4：按业务位生成状态文本。
+                // 为什么：将底层位值映射为上层可读语义。
+                // 风险点：位定义变更未同步会导致状态反转。
                 if (_buffer[3] == 0x01)
                     result = "按钮按下";
                 else
@@ -38,6 +47,12 @@ namespace SerialPortService.Services.Parser
             return false;
         }
 
-        public void Reset() => _index = 0;
+        public void Reset()
+        {
+            // 步骤1：重置解析索引。
+            // 为什么：在异常或复位场景恢复初始状态。
+            // 风险点：索引残留会导致下一帧错位。
+            _index = 0;
+        }
     }
 }

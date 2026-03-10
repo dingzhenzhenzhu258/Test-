@@ -32,6 +32,9 @@ namespace SerialPortService.Services.Handler
 
         // 统一通道模型：有界 + 限流，适配高并发采集
         private readonly Channel<T> _responseChannel;
+        private readonly Channel<T>? _waitModeQueue;
+        private readonly CancellationTokenSource _disposeCts = new CancellationTokenSource();
+        private readonly Task? _waitModeWriterTask;
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
         private int _activeRequests;
         private long _idleDroppedCount;
@@ -41,8 +44,11 @@ namespace SerialPortService.Services.Handler
         private long _timeoutCount;
         private long _matchedCount;
         private long _totalLatencyMs;
+        private long _waitModeQueueLength;
+        private long _waitModeQueueHighWatermark;
         private readonly int _metricsRegistrationId;
         private int _disposeSignaled;
+        private int _waitBacklogAlertActive;
 
         /// <summary>
         /// 创建通用处理器实例。
@@ -68,13 +74,26 @@ namespace SerialPortService.Services.Handler
                 throw new ArgumentOutOfRangeException(nameof(options), "ResponseChannelCapacity must be greater than 0");
             if (_options.SampleLogInterval < 0)
                 throw new ArgumentOutOfRangeException(nameof(options), "SampleLogInterval must be >= 0");
+            if (_options.WaitModeQueueCapacity <= 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "WaitModeQueueCapacity must be > 0");
 
             _responseChannel = Channel.CreateBounded<T>(new BoundedChannelOptions(_options.ResponseChannelCapacity)
             {
                 FullMode = _options.ResponseChannelFullMode,
                 SingleReader = true,
-                SingleWriter = true
+                SingleWriter = false
             });
+
+            if (_options.ResponseChannelFullMode == BoundedChannelFullMode.Wait)
+            {
+                _waitModeQueue = Channel.CreateBounded<T>(new BoundedChannelOptions(_options.WaitModeQueueCapacity)
+                {
+                    FullMode = BoundedChannelFullMode.DropWrite,
+                    SingleReader = true,
+                    SingleWriter = true
+                });
+                _waitModeWriterTask = Task.Run(() => DrainWaitModeQueueAsync(_disposeCts.Token));
+            }
 
             _metricsRegistrationId = GenericHandlerMetricsPublisher.Register(this);
         }
@@ -96,11 +115,51 @@ namespace SerialPortService.Services.Handler
         {
             if (Interlocked.Exchange(ref _disposeSignaled, 1) == 0)
             {
+                _responseChannel.Writer.TryComplete();
+                _disposeCts.Cancel();
+                _waitModeQueue?.Writer.TryComplete();
+                try
+                {
+                    _waitModeWriterTask?.GetAwaiter().GetResult();
+                }
+                catch
+                {
+                }
+
                 GenericHandlerMetricsPublisher.Unregister(_metricsRegistrationId);
                 GC.SuppressFinalize(this);
             }
 
             base.Dispose();
+            _disposeCts.Dispose();
+            _semaphore.Dispose();
+        }
+
+        private async Task DrainWaitModeQueueAsync(CancellationToken cancellationToken)
+        {
+            if (_waitModeQueue == null)
+            {
+                return;
+            }
+
+            try
+            {
+                await foreach (var item in _waitModeQueue.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var backlog = Interlocked.Decrement(ref _waitModeQueueLength);
+                    if (_options.WaitBacklogAlertThreshold > 0 && backlog < _options.WaitBacklogAlertThreshold)
+                    {
+                        Interlocked.Exchange(ref _waitBacklogAlertActive, 0);
+                    }
+                    await _responseChannel.Writer.WriteAsync(item, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (ChannelClosedException)
+            {
+            }
         }
 
         protected override IStreamParser<T> Parser => _parser;
@@ -109,22 +168,28 @@ namespace SerialPortService.Services.Handler
         {
             if (content == null) return;
 
+            // 步骤1：无活跃请求时按策略丢弃响应。
+            // 为什么：请求-响应模型下，空闲数据通常是噪声或无效上报。
+            // 风险点：若不丢弃，响应通道会被无关数据挤占。
             if (_options.DropWhenNoActiveRequest && Volatile.Read(ref _activeRequests) <= 0)
             {
                 var dropped = Interlocked.Increment(ref _idleDroppedCount);
                 if (ShouldSample(dropped))
                 {
-                    Logger.AddLog(LogLevel.Warning, $"[{_handlerName}] Dropped idle packets: {dropped}");
+                    Logger.AddLog(LogLevel.Warning, string.Concat("[", _handlerName, "] Dropped idle packets: ", dropped));
                 }
                 return;
             }
 
+            // 步骤2：尝试入队到响应通道。
+            // 为什么：后续匹配逻辑统一从通道读取。
+            // 风险点：入队失败若不统计，会掩盖背压瓶颈。
             if (!TryEnqueueResponse(content))
             {
                 var overflow = Interlocked.Read(ref _overflowDroppedCount);
                 if (ShouldSample(overflow))
                 {
-                    Logger.AddLog(LogLevel.Warning, $"[{_handlerName}] Dropped overflow packets: {overflow}");
+                    Logger.AddLog(LogLevel.Warning, string.Concat("[", _handlerName, "] Dropped overflow packets: ", overflow));
                 }
             }
         }
@@ -154,7 +219,9 @@ namespace SerialPortService.Services.Handler
                 Interlocked.Read(ref _timeoutCount),
                 Interlocked.Read(ref _matchedCount),
                 Interlocked.Read(ref _totalLatencyMs),
-                Volatile.Read(ref _activeRequests));
+                Volatile.Read(ref _activeRequests),
+                Interlocked.Read(ref _waitModeQueueLength),
+                Interlocked.Read(ref _waitModeQueueHighWatermark));
 
         /// <summary>
         /// 发送请求并等待匹配响应（通用核心流程）。
@@ -169,45 +236,61 @@ namespace SerialPortService.Services.Handler
             if (command == null || command.Length < 1)
                 throw new ArgumentException("Invalid command");
 
+            // 步骤1：串行化请求发送与匹配流程。
+            // 为什么：多数串口设备同一时刻只允许单请求在途。
+            // 风险点：并行请求会导致响应串台与匹配错乱。
             await _semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
                 Interlocked.Increment(ref _activeRequests);
 
-                while (_responseChannel.Reader.TryRead(out _)) { }
-
+                // 步骤2：按重试上限循环发送请求。
+                // 为什么：临时抖动场景可通过重试提升成功率。
+                // 风险点：重试过多会放大链路拥塞和超时累积。
                 for (int i = 0; i <= retryCount; i++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     var attemptWatch = Stopwatch.StartNew();
                     await this.Send(command).ConfigureAwait(false);
 
-                    using var timeoutCts = new CancellationTokenSource(timeout);
-                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
-
+                    // 步骤3：在超时窗口内持续读取并筛选响应。
+                    // 为什么：同一窗口可能收到主动上报或非匹配包。
+                    // 风险点：若不筛选，可能把错误响应返回给调用方。
                     while (true)
                     {
-                        T result;
-                        try
+                        if (!_responseChannel.Reader.TryRead(out var result))
                         {
-                            result = await _responseChannel.Reader.ReadAsync(linkedCts.Token).ConfigureAwait(false);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            if (cancellationToken.IsCancellationRequested)
+                            var remainingMs = timeout - (int)attemptWatch.ElapsedMilliseconds;
+                            if (remainingMs <= 0)
                             {
-                                throw;
+                                if (i < retryCount)
+                                {
+                                    Interlocked.Increment(ref _retryCount);
+                                    Logger.AddLog(LogLevel.Warning, string.Format("[{0}] Retry {1}/{2}...", _handlerName, i + 1, retryCount));
+                                    break;
+                                }
+
+                                Interlocked.Increment(ref _timeoutCount);
+                    TryLogTimeoutRateAlert();
+                                throw new TimeoutException($"Request timeout after {retryCount + 1} attempts");
                             }
 
-                            if (i < retryCount)
+                            var canRead = await WaitToReadAsyncWithTimeout(_responseChannel.Reader, remainingMs, cancellationToken).ConfigureAwait(false);
+                            if (!canRead)
                             {
-                                Interlocked.Increment(ref _retryCount);
-                                Logger.AddLog(LogLevel.Warning, $"[{_handlerName}] Retry {i + 1}/{retryCount}...");
-                                break;
+                                if (i < retryCount)
+                                {
+                                    Interlocked.Increment(ref _retryCount);
+                                    Logger.AddLog(LogLevel.Warning, string.Format("[{0}] Retry {1}/{2}...", _handlerName, i + 1, retryCount));
+                                    break;
+                                }
+
+                                Interlocked.Increment(ref _timeoutCount);
+                                TryLogTimeoutRateAlert();
+                                throw new TimeoutException($"Request timeout after {retryCount + 1} attempts");
                             }
 
-                            Interlocked.Increment(ref _timeoutCount);
-                            throw new TimeoutException($"Request timeout after {retryCount + 1} attempts");
+                            continue;
                         }
 
                         if (IsReportPacket(result))
@@ -218,7 +301,7 @@ namespace SerialPortService.Services.Handler
                             }
                             catch (Exception ex)
                             {
-                                Logger.AddLog(LogLevel.Error, $"[{_handlerName}] Report packet handling failed: {ex.Message}", exception: ex);
+                                Logger.AddLog(LogLevel.Error, string.Concat("[", _handlerName, "] Report packet handling failed: ", ex.Message), exception: ex);
                             }
                             continue;
                         }
@@ -234,7 +317,7 @@ namespace SerialPortService.Services.Handler
                         var unmatched = Interlocked.Increment(ref _unmatchedCount);
                         if (ShouldSample(unmatched))
                         {
-                            Logger.AddLog(LogLevel.Warning, $"[{_handlerName}] Skipped unmatched packets: {unmatched}, Last: {BuildUnmatchedLog(result)}");
+                            Logger.AddLog(LogLevel.Warning, string.Concat("[", _handlerName, "] Skipped unmatched packets: ", unmatched, ", Last: ", BuildUnmatchedLog(result)));
                         }
                     }
                 }
@@ -245,6 +328,32 @@ namespace SerialPortService.Services.Handler
             {
                 Interlocked.Decrement(ref _activeRequests);
                 _semaphore.Release();
+            }
+        }
+
+        private static async Task<bool> WaitToReadAsyncWithTimeout(ChannelReader<T> reader, int timeoutMs, CancellationToken cancellationToken)
+        {
+            if (timeoutMs <= 0)
+            {
+                return reader.TryPeek(out _);
+            }
+
+            if (reader.TryPeek(out _))
+            {
+                return true;
+            }
+
+            try
+            {
+                return await reader
+                    .WaitToReadAsync(cancellationToken)
+                    .AsTask()
+                    .WaitAsync(TimeSpan.FromMilliseconds(timeoutMs), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                return false;
             }
         }
 
@@ -264,25 +373,97 @@ namespace SerialPortService.Services.Handler
         /// <returns>写入成功返回 true，否则 false</returns>
         protected bool TryEnqueueResponse(T content)
         {
+            // 步骤1：优先直写主响应通道。
+            // 为什么：减少额外排队延迟。
+            // 风险点：主通道满载时需转入背压策略。
             if (_responseChannel.Writer.TryWrite(content))
             {
                 return true;
             }
 
-            if (_options.ResponseChannelFullMode != BoundedChannelFullMode.Wait)
+            if (_options.ResponseChannelFullMode == BoundedChannelFullMode.Wait)
             {
+                // 步骤2：Wait 模式下写入临时背压队列。
+                // 为什么：避免主解析线程长期阻塞。
+                // 风险点：背压队列满后仍会丢包，需配合告警观测。
+                if (_waitModeQueue != null && _waitModeQueue.Writer.TryWrite(content))
+                {
+                    var backlog = Interlocked.Increment(ref _waitModeQueueLength);
+                    UpdateHighWatermark(backlog);
+                    TryLogWaitBacklogAlert(backlog);
+
+                    if (ShouldSample(backlog))
+                    {
+                        Logger.AddLog(LogLevel.Warning, string.Concat("[", _handlerName, "] Wait backlog=", backlog, ", high=", Interlocked.Read(ref _waitModeQueueHighWatermark)));
+                    }
+
+                    return true;
+                }
+
+                // 步骤3：背压队列也满时计入溢出丢弃。
+                // 为什么：明确记录在极端负载下的数据损失。
+                // 风险点：若只静默丢弃，压测结论会被误导。
                 Interlocked.Increment(ref _overflowDroppedCount);
                 return false;
             }
 
-            if (_responseChannel.Reader.TryRead(out _))
-            {
-                Interlocked.Increment(ref _overflowDroppedCount);
-                return _responseChannel.Writer.TryWrite(content);
-            }
-
             Interlocked.Increment(ref _overflowDroppedCount);
             return false;
+        }
+
+        private void UpdateHighWatermark(long current)
+        {
+            while (true)
+            {
+                var observed = Interlocked.Read(ref _waitModeQueueHighWatermark);
+                if (current <= observed)
+                {
+                    return;
+                }
+
+                if (Interlocked.CompareExchange(ref _waitModeQueueHighWatermark, current, observed) == observed)
+                {
+                    return;
+                }
+            }
+        }
+
+        private void TryLogTimeoutRateAlert()
+        {
+            var threshold = _options.TimeoutRateAlertThresholdPercent;
+            var minSamples = _options.TimeoutRateAlertMinSamples;
+            if (threshold <= 0 || minSamples <= 0)
+            {
+                return;
+            }
+
+            var timeouts = Interlocked.Read(ref _timeoutCount);
+            var matched = Interlocked.Read(ref _matchedCount);
+            var total = timeouts + matched;
+            if (total < minSamples || total % minSamples != 0)
+            {
+                return;
+            }
+
+            var timeoutRatePercent = (double)timeouts * 100d / total;
+            if (timeoutRatePercent >= threshold)
+            {
+                Logger.AddLog(LogLevel.Error, $"[{_handlerName}] Timeout rate alert: {timeoutRatePercent:F2}% (timeouts={timeouts}, matched={matched}, threshold={threshold}%)");
+            }
+        }
+
+        private void TryLogWaitBacklogAlert(long backlog)
+        {
+            var threshold = _options.WaitBacklogAlertThreshold;
+            if (threshold <= 0 || backlog < threshold)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _waitBacklogAlertActive, 1, 0) == 0)
+            {
+                Logger.AddLog(LogLevel.Error, $"[{_handlerName}] Wait backlog alert: backlog={backlog}, threshold={threshold}");
+            }
         }
     }
 }

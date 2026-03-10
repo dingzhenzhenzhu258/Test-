@@ -29,8 +29,14 @@ namespace SerialPortService.Services.Interfaces
         /// </remarks>
         void Parse(ReadOnlySpan<byte> data, List<T> output)
         {
+            // 步骤1：逐字节调用 TryParse。
+            // 为什么：默认实现需兼容状态机解析器按字节推进。
+            // 风险点：若按块假设完整帧，遇到分片输入会解析失败。
             foreach (byte b in data)
             {
+                // 步骤2：仅在解析成功时输出结果。
+                // 为什么：保持输出集合只包含完整业务对象。
+                // 风险点：误加半成品结果会污染上层处理逻辑。
                 if (TryParse(b, out T? result))
                 {
                     output.Add(result);

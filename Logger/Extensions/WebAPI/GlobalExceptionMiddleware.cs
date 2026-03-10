@@ -69,7 +69,7 @@ namespace Logger.Extensions.WebAPI
             {
                 // 一旦后续有任何没有 try-catch 的报错，全都会掉进这里
                 // 记录错误（Serilog 会自动带着行号和方法名把它推送到云端）
-                _logger.AddLog(LogLevel.Error, $"WebAPI 发生未处理的全局异常: {ex.Message}", exception: ex);
+                _logger.AddLog(LogLevel.Error, string.Concat("WebAPI 发生未处理的全局异常: ", ex.Message), exception: ex);
 
                 // 统一处理给前端的返回格式
                 await HandleExceptionAsync(context, ex);

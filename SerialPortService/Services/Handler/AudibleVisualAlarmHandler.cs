@@ -18,12 +18,15 @@ namespace SerialPortService.Services.Handler
         public AudibleVisualAlarmHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
             : base(portName, baudRate, parity, dataBits, stopBits, logger)
         {
-            // 将获取 _lastSent 的能力传给解析器
-            // 这样解析器就能在底层直接进行"发送 vs 接收"的对比
+            // 步骤1：将“最后发送报文访问器”注入解析器。
+            // 为什么：解析器需要在收包时做发送-接收一致性比对。
+            // 风险点：若无法访问最后发送报文，将失去一致性校验能力。
             _parser = new AlarmParser(() => _lastSent);
         }
 
-        // 2. 实现基类的抽象属性，提供解析器
+        // 步骤1：向基类暴露解析器。
+        // 为什么：基类读取流水线依赖该属性执行解析。
+        // 风险点：返回错误解析器会导致报警器报文误判。
         protected override IStreamParser<string> Parser => _parser;
 
         // =================================================================
@@ -31,6 +34,9 @@ namespace SerialPortService.Services.Handler
         // =================================================================
         public static byte[] BuildCommand(LedMode led, BuzzerMode buzzer, FlashFrequency flash)
         {
+            // 步骤1：按设备协议固定格式组帧。
+            // 为什么：报警器命令必须满足头-参数-尾格式。
+            // 风险点：字段顺序错误会导致设备拒收命令。
             return new byte[]
             {
                 0xFF,               // 命令头

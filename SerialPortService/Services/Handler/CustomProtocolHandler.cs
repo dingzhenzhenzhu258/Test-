@@ -53,7 +53,14 @@ namespace SerialPortService.Services.Handler
         /// </summary>
         public async Task<CustomFrame> SendRequestAsync(byte command, byte[]? payload = null, int timeout = 1000, int retryCount = 3, CancellationToken cancellationToken = default)
         {
+            // 步骤1：构建协议请求帧。
+            // 为什么：统一由帧构建器保证报文字段和校验一致性。
+            // 风险点：手工拼帧容易出现长度或校验错误。
             var request = CustomProtocolFrameBuilder.Build(command, payload ?? Array.Empty<byte>());
+
+            // 步骤2：发送并等待匹配响应。
+            // 为什么：复用 GenericHandler 的超时、重试、匹配与告警机制。
+            // 风险点：超时参数配置不当会导致误重试或响应延迟。
             return await SendRequestCoreAsync(request, timeout, retryCount, cancellationToken);
         }
     }

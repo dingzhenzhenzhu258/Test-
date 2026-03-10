@@ -26,44 +26,50 @@ namespace SerialPortService.Services.Parser
         
         public bool TryParse(byte b, [NotNullWhen(true)] out string? result)
         {
+            // 步骤1：默认结果置空。
+            // 为什么：仅完整且校验通过的报文才输出结果。
+            // 风险点：结果残留会导致状态误判。
             result = null;
 
-            // --- 状态机逻辑 ---
-
-            // 1. 找包头 0xFF
+            // 步骤2：查找包头 0xFF。
+            // 为什么：从串流中定位一帧起始边界。
+            // 风险点：包头判断错误会造成整帧错位。
             if (_index == 0)
             {
                 if (b == 0xFF)
                 {
                     _buffer[_index++] = b;
                 }
-                // 如果不是FF，忽略，继续等
                 return false;
             }
 
-            // 2. 接收中间数据 (索引 1, 2, 3)
+            // 步骤3：接收中间数据区。
+            // 为什么：固定 5 字节协议需依次填充 LED/Buzzer/Flash。
+            // 风险点：中间区丢字节会导致尾校验无效。
             if (_index < 4)
             {
                 _buffer[_index++] = b;
                 return false;
             }
 
-            // 3. 校验包尾 0xAA (索引 4)
+            // 步骤4：校验包尾 0xAA。
+            // 为什么：确认报文完整性。
+            // 风险点：尾字节错误应及时重置状态避免污染后续解析。
             if (_index == 4)
             {
                 if (b == 0xAA)
                 {
                     _buffer[_index] = b; // 填入最后一个字节
 
-                    // --- 解析成功！开始业务对比逻辑 (原 Handle 方法的逻辑) ---
-
-                    // 拷贝一份当前收到的完整包
+                    // 步骤5：拷贝完整接收包并重置索引。
+                    // 为什么：后续对比和下一个包接收都依赖干净状态。
+                    // 风险点：不拷贝直接复用缓冲区会被后续写入覆盖。
                     byte[] receivedData = _buffer.ToArray();
-
-                    // 重置索引，准备接收下一个包
                     _index = 0;
 
-                    // 获取最后发送的数据
+                    // 步骤6：获取最后发送报文并执行一致性对比。
+                    // 为什么：报警器回包应与发送命令一致。
+                    // 风险点：未对比会放过错误回包或串口串台。
                     byte[]? lastSent = _getLastSentFunc();
 
                     if (lastSent != null)
@@ -94,12 +100,15 @@ namespace SerialPortService.Services.Parser
                 }
                 else
                 {
-                    // 包尾不对？可能是数据错位了
-                    // 简单的容错处理：重置状态
-                    // 进阶写法：如果 b 是 0xFF，可以直接设 _index=1，视作新包开始
+                    // 步骤7：包尾错误时执行容错重置。
+                    // 为什么：快速恢复状态机，等待下一帧起点。
+                    // 风险点：不重置会让解析持续错位。
                     _index = 0;
-                    if (b == 0xFF) // 也许这个错误的尾巴其实是下一个包的头？
+                    if (b == 0xFF)
                     {
+                        // 步骤7.1：若当前字节可能是新包头，立即复用。
+                        // 为什么：减少错位后的恢复时间。
+                        // 风险点：误判包头会再次进入错误状态。
                         _buffer[_index++] = b;
                     }
                     return false;
@@ -111,6 +120,9 @@ namespace SerialPortService.Services.Parser
 
         public void Reset()
         {
+            // 步骤1：重置索引。
+            // 为什么：恢复解析器初始状态。
+            // 风险点：索引残留会导致下一帧错位。
             _index = 0;
         }
     }

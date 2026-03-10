@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Windows;
+using System.Windows.Controls;
 using Test_High_speed_acquisition.ViewModels.Windows;
 
 namespace Test_High_speed_acquisition.Views.Windows
@@ -20,6 +21,14 @@ namespace Test_High_speed_acquisition.Views.Windows
             if (DataContext is MainWindowViewModel vm)
             {
                 vm.Cleanup();
+            }
+        }
+
+        private void ReceivedDataTextBox_OnTextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (sender is TextBox textBox)
+            {
+                textBox.ScrollToEnd();
             }
         }
     }

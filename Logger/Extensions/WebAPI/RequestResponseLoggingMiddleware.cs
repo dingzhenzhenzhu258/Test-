@@ -67,9 +67,11 @@ namespace Logger.Extensions.WebAPI
                 // 4. 打包输出到日志 (发送给 OpenObserve)
                 _logger.AddLog(
                     LogLevel.Information,
-                    $"【HTTP 交互记录】 {context.Request.Method} {context.Request.Path} | 耗时: {watch.ElapsedMilliseconds}ms | 状态码: {context.Response.StatusCode} \n" +
-                    $"[Request Body] : {requestBody}\n" +
-                    $"[Response Body]: {responseBody}");
+                    string.Concat(
+                        "【HTTP 交互记录】 ", context.Request.Method, " ", context.Request.Path,
+                        " | 耗时: ", watch.ElapsedMilliseconds, "ms | 状态码: ", context.Response.StatusCode, " \n",
+                        "[Request Body] : ", requestBody, "\n",
+                        "[Response Body]: ", responseBody));
 
                 // 5. 【极其关键】把我们内存流里的数据，写回到真正的原始响应流中发给客户端
                 await memoryStream.CopyToAsync(originalBodyStream);

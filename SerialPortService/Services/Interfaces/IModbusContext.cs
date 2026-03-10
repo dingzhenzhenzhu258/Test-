@@ -1,4 +1,5 @@
 using SerialPortService.Models;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -19,5 +20,12 @@ namespace SerialPortService.Services.Interfaces
         /// <param name="cancellationToken">外部取消令牌</param>
         /// <returns>解析后的 Modbus 响应包</returns>
         Task<ModbusPacket> SendRequestAsync(byte[] command, int timeout = 1000, int retryCount = 3, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// 读取解析完成的 Modbus 报文流。
+        /// 适用于高速采集场景：解析线程生产完整报文，业务线程异步消费。
+        /// </summary>
+        /// <param name="cancellationToken">读取取消令牌</param>
+        IAsyncEnumerable<ModbusPacket> ReadParsedPacketsAsync(CancellationToken cancellationToken = default);
     }
 }

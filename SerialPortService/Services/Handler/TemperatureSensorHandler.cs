@@ -1,5 +1,6 @@
 ﻿using SerialPortService.Models;
 using SerialPortService.Services.Interfaces;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.IO.Ports;
@@ -12,11 +13,8 @@ namespace SerialPortService.Services.Handler
     /// <summary>
     /// 温湿度传感器处理器
     /// </summary>
-using Microsoft.Extensions.Logging;
-// ...
     public class TemperatureSensorHandler : ModbusHandler
     {
-        // ...
         public TemperatureSensorHandler(
             string portName,
             int baudRate,
@@ -27,8 +25,13 @@ using Microsoft.Extensions.Logging;
             ILogger logger) // 保持签名兼容工厂调用
             : base(portName, baudRate, parity, dataBits, stopBits, logger)
         {
-            // 如果传入的 parser 不是 ModbusRtuParser，这里可能会有行为不一致
-            // 但目前架构下，TemperatureSensor 总是用 ModbusRTU
+            // 步骤1：保持构造签名与工厂兼容。
+            // 为什么：历史调用路径会传入 parser 参数。
+            // 风险点：直接移除参数会破坏现有调用方兼容性。
+
+            // 步骤2：当前实现统一复用 ModbusHandler 解析链路。
+            // 为什么：温湿度设备当前协议固定为 ModbusRTU。
+            // 风险点：若未来引入非 RTU 解析器，需要在此处显式分支处理。
         }
     }
 }

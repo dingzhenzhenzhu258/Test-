@@ -7,27 +7,45 @@ using System.Threading.Tasks;
 namespace SerialPortService.Services.Interfaces
 {
     /// <summary>
-    /// 串口上下文接口
+    /// 串口上下文抽象。
+    /// 统一定义串口生命周期与发送入口。
     /// </summary>
     public interface IPortContext : IDisposable
     {
+        /// <summary>
+        /// 串口名称（例如 COM3）。
+        /// </summary>
         string Name { get; }
+
+        /// <summary>
+        /// 打开串口并启动处理流水线。
+        /// </summary>
         void Open();
+
+        /// <summary>
+        /// 关闭串口并停止处理流水线。
+        /// </summary>
         void Close();
+
+        /// <summary>
+        /// 发送原始数据。
+        /// </summary>
+        /// <param name="data">待发送数据</param>
+        /// <returns>已发送数据（通常用于链路追踪）</returns>
         Task<byte[]> Send(byte[] data);
 
-        event EventHandler<object>? OnHandleChanged; // 或者 EventHandler<OperateResult<object>>
+        /// <summary>
+        /// 解析结果回调事件。
+        /// </summary>
+        event EventHandler<object>? OnHandleChanged;
     }
 
     /// <summary>
-    /// 泛型串口上下文接口 (支持强类型 SendRequestAsync)
+    /// 泛型串口上下文接口。
+    /// 为特定协议上下文提供强类型扩展能力预留。
     /// </summary>
-    /// <typeparam name="T"></typeparam>
+    /// <typeparam name="T">解析结果类型</typeparam>
     public interface IPortContext<T> : IPortContext
     {
-        // 可以在这里定义特定于 T 的方法，比如
-        // Task<T> SendRequestAsync(byte[] command, int timeout = 1000);
-        // 但由于 SendRequestAsync 的实现通常依赖于具体的协议逻辑（如 ModbusHandler），
-        // 放在这里可能不通用。不过我们可以让 ModbusHandler 实现一个特定的接口。
     }
 }

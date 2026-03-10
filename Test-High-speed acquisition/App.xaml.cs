@@ -70,7 +70,7 @@ namespace Test_High_speed_acquisition
                 services.AddSingleton<IContentDialogService, ContentDialogService>();
 
                 // 注册 SerialPortService 以便在应用程序中使用串口通信功能
-                services.AddSerialPortService();
+                services.AddSerialPortService(context.Configuration);
 
                 // 注册 Dispatcher 以便在 ViewModel 中使用它来执行 UI 线程上的操作
                 services.AddSingleton(_ => Current.Dispatcher);

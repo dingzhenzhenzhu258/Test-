@@ -12,6 +12,14 @@ namespace AvailableVerificationAlgorithms.Crc
         /// <param name="originalData"></param>
         /// <returns></returns>
         public static ushort CalcCRC16(byte[] originalData)
+            => CalcCRC16(originalData.AsSpan());
+
+        /// <summary>
+        /// 计算一段数据的 CRC16 校验码（Span 重载，避免额外数组分配）
+        /// </summary>
+        /// <param name="originalData">待计算的数据片段</param>
+        /// <returns>CRC16</returns>
+        public static ushort CalcCRC16(ReadOnlySpan<byte> originalData)
         {
             uint crc16 = 0xFFFF;
             for (int i = 0; i < originalData.Length; i++)

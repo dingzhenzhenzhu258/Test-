@@ -87,6 +87,8 @@ namespace SerialPortService.Services
         /// 运行状态
         /// </summary>
         private volatile bool _isRunning = false;
+        private long _reconnectCycleCount;
+        private long _reconnectExhaustedCount;
 
         /// <summary>
         /// 串口名
@@ -150,6 +152,9 @@ namespace SerialPortService.Services
         /// </summary>
         public void Open()
         {
+            // 步骤1：幂等保护，避免重复启动管线。
+            // 为什么：重复启动会创建多组读写任务导致竞争。
+            // 风险点：多任务并发读写同一串口会触发不可预期错误。
             if (_isRunning) return;
             if (!_port.IsOpen) _port.Open();
 
@@ -157,6 +162,9 @@ namespace SerialPortService.Services
             _cts = new CancellationTokenSource();
 
             // 1. 启动 IO 读取任务 (异步读取 BaseStream，避免轮询与 Thread.Sleep)
+            // 步骤2：按“读-解析-发送”顺序启动后台任务。
+            // 为什么：拆分职责便于背压控制与性能观测。
+            // 风险点：任一任务未启动会造成数据链路断裂。
             _ioTask = Task.Run(() => IoReadLoopAsync(_cts.Token));
 
             // 2. 启动 解析任务 (消费原始数据 -> 状态机)
@@ -173,11 +181,17 @@ namespace SerialPortService.Services
         /// </summary>
         public void Close()
         {
+            // 步骤1：先标记停止并关闭通道写端。
+            // 为什么：通知后台任务尽快退出循环。
+            // 风险点：若不先停写，关闭期间可能继续有新消息进入。
             _isRunning = false;
             _sendChannel.Writer.TryComplete();
             _rawInputChannel.Writer.TryComplete();
             _cts?.Cancel();
 
+            // 步骤2：等待后台任务有序结束。
+            // 为什么：尽量避免在任务运行中直接关闭串口句柄。
+            // 风险点：强行关闭会导致对象释放异常和数据中断。
             if (_ioTask != null || _parseTask != null || _sendTask != null)
             {
                 var tasks = new List<Task>();
@@ -186,18 +200,43 @@ namespace SerialPortService.Services
                 if (_sendTask != null) tasks.Add(_sendTask);
                 try
                 {
-                    Task.WaitAll(tasks.ToArray(), 500);
+                    var completed = Task.WaitAll(tasks.ToArray(), 2000);
+                    if (!completed)
+                    {
+                        Logger.AddLog(LogLevel.Warning, $"[{Name}] Pipeline stop timeout, forcing serial port close");
+                    }
+                }
+                catch (AggregateException ex)
+                {
+                    Logger.AddLog(LogLevel.Warning, $"[{Name}] Pipeline stop raised exception: {ex.Flatten().Message}", exception: ex);
                 }
                 catch
                 {
                 }
             }
 
+            // 步骤3：关闭底层串口句柄。
+            // 为什么：释放系统资源并允许后续重新打开。
+            // 风险点：未关闭会造成端口被占用。
             if (_port.IsOpen)
             {
-                // 清空缓冲区并关闭串口
-                _port.DiscardInBuffer();
-                _port.Close();
+                try
+                {
+                    _port.DiscardInBuffer();
+                }
+                catch (Exception ex)
+                {
+                    Logger.AddLog(LogLevel.Warning, $"[{Name}] DiscardInBuffer failed: {ex.Message}", exception: ex);
+                }
+
+                try
+                {
+                    _port.Close();
+                }
+                catch (Exception ex)
+                {
+                    Logger.AddLog(LogLevel.Warning, $"[{Name}] Close failed: {ex.Message}", exception: ex);
+                }
             }
         }
 
@@ -342,9 +381,24 @@ namespace SerialPortService.Services
         /// <returns></returns>
         public async Task<byte[]> Send(byte[] data)
         {
-            if (!_port.IsOpen) return data;
+            // 步骤1：发送前进行数据与状态校验。
+            // 为什么：在进入发送队列前尽早返回明确失败原因。
+            // 风险点：无校验会把无效数据带入发送管线。
+            if (data == null || data.Length == 0)
+            {
+                throw new ArgumentException("发送数据不能为空", nameof(data));
+            }
+
+            if (!_isRunning || !_port.IsOpen)
+            {
+                throw new InvalidOperationException($"串口 {Name} 未打开，发送失败");
+            }
+
+            // 步骤2：入队交给发送任务异步写入。
+            // 为什么：避免业务线程直接阻塞在串口 IO。
+            // 风险点：若发送队列失控，可能造成内存压力上升。
             var packet = new DataPacket(data);
-            await _sendChannel.Writer.WriteAsync(packet);
+            await _sendChannel.Writer.WriteAsync(packet).ConfigureAwait(false);
             return data;
         }
 
@@ -364,6 +418,7 @@ namespace SerialPortService.Services
 
                     if (!_port.IsOpen && !await TryReconnectAsync(token, "write path detected closed port").ConfigureAwait(false))
                     {
+                        Logger.AddLog(LogLevel.Error, $"[IO Write] Send dropped due to reconnect failure. Port={Name}, Bytes={msg.Data.Length}");
                         continue;
                     }
 
@@ -391,6 +446,9 @@ namespace SerialPortService.Services
             var maxAttempts = SerialPortReconnectPolicy.MaxReconnectAttempts;
             var intervalMs = SerialPortReconnectPolicy.ReconnectIntervalMs;
 
+            // 步骤1：按最大次数执行重连尝试。
+            // 为什么：给短暂链路故障留恢复窗口。
+            // 风险点：无限重试会造成线程长期占用。
             for (int attempt = 1; attempt <= maxAttempts && !token.IsCancellationRequested; attempt++)
             {
                 try
@@ -402,8 +460,12 @@ namespace SerialPortService.Services
                         return true;
                     }
 
+                    // 步骤2：重连成功后立即记录结果并返回。
+                    // 为什么：尽快恢复读写链路，减少业务中断。
+                    // 风险点：成功后不及时返回会产生多余重连动作。
                     _port.Open();
                     Logger.AddLog(LogLevel.Warning, $"[{Name}] Reconnected successfully. Reason={reason}, Attempt={attempt}/{maxAttempts}");
+                    ObserveReconnectOutcome(isExhausted: false);
                     return true;
                 }
                 catch (Exception ex) when (!token.IsCancellationRequested)
@@ -411,6 +473,9 @@ namespace SerialPortService.Services
                     Logger.AddLog(LogLevel.Warning, $"[{Name}] Reconnect failed. Reason={reason}, Attempt={attempt}/{maxAttempts}, Error={ex.Message}");
                 }
 
+                // 步骤3：失败后按间隔退避。
+                // 为什么：避免连续重试造成设备或总线压力。
+                // 风险点：无退避会触发重连风暴。
                 if (attempt < maxAttempts)
                 {
                     try
@@ -424,8 +489,40 @@ namespace SerialPortService.Services
                 }
             }
 
+            // 步骤4：重连耗尽后记录失败告警。
+            // 为什么：给上层提供可观测故障信号。
+            // 风险点：无耗尽告警会导致故障长期隐蔽。
             Logger.AddLog(LogLevel.Error, $"[{Name}] Reconnect exhausted. Reason={reason}, MaxAttempts={maxAttempts}");
+            ObserveReconnectOutcome(isExhausted: true);
             return false;
+        }
+
+        private void ObserveReconnectOutcome(bool isExhausted)
+        {
+            var total = Interlocked.Increment(ref _reconnectCycleCount);
+            if (isExhausted)
+            {
+                Interlocked.Increment(ref _reconnectExhaustedCount);
+            }
+
+            var thresholdPercent = SerialPortReconnectPolicy.ReconnectFailureRateAlertThresholdPercent;
+            var minSamples = SerialPortReconnectPolicy.ReconnectFailureRateAlertMinSamples;
+            if (thresholdPercent <= 0 || minSamples <= 0)
+            {
+                return;
+            }
+
+            if (total < minSamples || total % minSamples != 0)
+            {
+                return;
+            }
+
+            var exhausted = Interlocked.Read(ref _reconnectExhaustedCount);
+            var failureRatePercent = (double)exhausted * 100d / total;
+            if (failureRatePercent >= thresholdPercent)
+            {
+                Logger.AddLog(LogLevel.Error, $"[{Name}] Reconnect failure-rate alert: {failureRatePercent:F2}% (exhausted={exhausted}, total={total}, threshold={thresholdPercent}%)");
+            }
         }
 
         /// <summary>
