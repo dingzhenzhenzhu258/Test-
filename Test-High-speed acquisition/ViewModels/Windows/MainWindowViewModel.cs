@@ -1,11 +1,14 @@
 ﻿using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using SerialPortService.Helpers;
+using SerialPortService.Models;
 using SerialPortService.Models.Emuns;
+using SerialPortService.Services.Handler;
 using SerialPortService.Services.Interfaces;
 using System.Diagnostics;
 using System.Collections.ObjectModel;
 using System.IO.Ports;
+using System.Linq;
 using System.Text;
 using System.Threading.Channels;
 using System.Windows.Threading;
@@ -27,6 +30,9 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         private CancellationTokenSource? _acquisitionCts;
         private Task? _sendLoopTask;
         private Task? _receiveLoopTask;
+        private Task? _diagnosticTask;
+        private Task[]? _persistWorkerTasks;
+        private Channel<ModbusPacket>? _persistQueue;
         private IModbusContext? _modbusContext;
         private readonly Channel<string> _uiLines;
         private readonly DispatcherTimer _uiFlushTimer;
@@ -37,6 +43,10 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         private long _segmentReceiveCount;
         private int _segmentIndex;
         private readonly ILogger<MainWindowViewModel> _logger;
+        private const int PersistWorkerCount = 4;
+        private const int PersistBatchSize = 200;
+        private const int PersistBatchWindowMs = 500;
+        private const int DiagnosticIntervalMs = 5000;
 
         public MainWindowViewModel(ISerialPortService serialPortService, Dispatcher dispatcher, ILogger<MainWindowViewModel> logger)
         {
@@ -63,6 +73,115 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             if (AvailablePorts.Count > 0)
             {
                 SelectedPort = AvailablePorts[0];
+            }
+        }
+
+        private async Task ReceiveLoopAsync(IModbusContext modbus, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await foreach (var packet in modbus.ReadParsedPacketsAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    if (_persistQueue == null)
+                    {
+                        continue;
+                    }
+
+                    await _persistQueue.Writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        private async Task PersistWorkerLoopAsync(CancellationToken cancellationToken)
+        {
+            if (_persistQueue == null)
+            {
+                return;
+            }
+
+            var batch = new List<ModbusPacket>(PersistBatchSize);
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var hasData = await _persistQueue.Reader
+                        .WaitToReadAsync(cancellationToken)
+                        .AsTask()
+                        .WaitAsync(TimeSpan.FromMilliseconds(PersistBatchWindowMs), cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (hasData)
+                    {
+                        while (batch.Count < PersistBatchSize && _persistQueue.Reader.TryRead(out var packet))
+                        {
+                            batch.Add(packet);
+                        }
+                    }
+                }
+                catch (TimeoutException)
+                {
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                if (batch.Count > 0)
+                {
+                    await PersistBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+                    batch.Clear();
+                }
+            }
+
+            if (batch.Count > 0)
+            {
+                await PersistBatchAsync(batch, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+
+        private Task PersistBatchAsync(List<ModbusPacket> batch, CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("Persist batch size={BatchSize}", batch.Count);
+            return Task.CompletedTask;
+        }
+
+        private async Task DiagnosticLoopAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(DiagnosticIntervalMs, cancellationToken).ConfigureAwait(false);
+
+                    var memoryMb = GC.GetTotalMemory(false) / 1024d / 1024d;
+                    var threadCount = Process.GetCurrentProcess().Threads.Count;
+                    var gc0 = GC.CollectionCount(0);
+                    var gc1 = GC.CollectionCount(1);
+                    var gc2 = GC.CollectionCount(2);
+
+                    if (_modbusContext is ModbusHandler handler)
+                    {
+                        var metrics = handler.GetMetrics();
+                        var parsedDrop = handler.GetParsedPacketDropCount();
+                        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG waitBacklog={metrics.WaitBacklog}, parsedPacketDrop={parsedDrop}, mem={memoryMb:F1}MB, threads={threadCount}, gc={gc0}/{gc1}/{gc2}");
+                    }
+                    else
+                    {
+                        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG mem={memoryMb:F1}MB, threads={threadCount}, gc={gc0}/{gc1}/{gc2}");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "DiagnosticLoopAsync failed");
+                }
             }
         }
 
@@ -190,7 +309,7 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 return;
             }
 
-            _serialPortService.ClosePort(SelectedPort);
+            await _serialPortService.ClosePortAsync(SelectedPort);
             StatusMessage = "串口上下文不是 Modbus 上下文";
         }
 
@@ -210,7 +329,7 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 await StopAcquisitionAsync();
             }
 
-            var result = _serialPortService.ClosePort(SelectedPort);
+            var result = await _serialPortService.ClosePortAsync(SelectedPort);
             if (result.IsSuccess)
             {
                 _modbusContext = null;
@@ -256,8 +375,20 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             _segmentIndex++;
 
             _acquisitionCts = new CancellationTokenSource();
+            _persistQueue = Channel.CreateBounded<ModbusPacket>(new BoundedChannelOptions(8192)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleWriter = true,
+                SingleReader = false
+            });
+
+            _persistWorkerTasks = Enumerable.Range(0, PersistWorkerCount)
+                .Select(_ => Task.Run(() => PersistWorkerLoopAsync(_acquisitionCts.Token)))
+                .ToArray();
+
             _sendLoopTask = Task.Run(() => SendLoopAsync(_modbusContext, _acquisitionCts.Token));
-            _receiveLoopTask = null;
+            _receiveLoopTask = Task.Run(() => ReceiveLoopAsync(_modbusContext, _acquisitionCts.Token));
+            _diagnosticTask = Task.Run(() => DiagnosticLoopAsync(_acquisitionCts.Token));
 
             IsAcquiring = true;
             _uiLines.Writer.TryWrite($"===== 第{_segmentIndex}段开始 =====");
@@ -278,19 +409,25 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 _acquisitionCts.Cancel();
             }
 
-            if (_sendLoopTask != null || _receiveLoopTask != null)
+            if (_persistQueue != null)
             {
-                var tasks = new[] { _sendLoopTask, _receiveLoopTask }
-                    .Where(t => t != null)
-                    .Cast<Task>()
-                    .ToArray();
+                _persistQueue.Writer.TryComplete();
+            }
+
+            if (_sendLoopTask != null || _receiveLoopTask != null || _diagnosticTask != null || (_persistWorkerTasks?.Length > 0))
+            {
+                var tasks = new List<Task>();
+                if (_sendLoopTask != null) tasks.Add(_sendLoopTask);
+                if (_receiveLoopTask != null) tasks.Add(_receiveLoopTask);
+                if (_diagnosticTask != null) tasks.Add(_diagnosticTask);
+                if (_persistWorkerTasks != null) tasks.AddRange(_persistWorkerTasks);
 
                 try
                 {
                     // 步骤1：等待发送任务有序退出，并设置超时上限。
                     // 为什么：避免串口异常场景下关闭流程无限等待。
                     // 风险点：无超时兜底会导致停止采集或关窗卡死。
-                    await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(3));
+                    await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5));
                 }
                 catch (OperationCanceledException)
                 {
@@ -308,6 +445,9 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             _acquisitionCts = null;
             _sendLoopTask = null;
             _receiveLoopTask = null;
+            _diagnosticTask = null;
+            _persistWorkerTasks = null;
+            _persistQueue = null;
             IsAcquiring = false;
 
             _uiLines.Writer.TryWrite($"===== 第{_segmentIndex}段结束，发送={Interlocked.Read(ref _segmentSendCount)}，接收={Interlocked.Read(ref _segmentReceiveCount)} =====");

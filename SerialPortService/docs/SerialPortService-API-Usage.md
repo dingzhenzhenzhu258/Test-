@@ -42,17 +42,38 @@
 1) 异步流消费（推荐用于高吞吐/可取消场景）
 
 ```csharp
-// 在业务线程中持续消费解析完成的报文
+// 生产建议：有界队列 + 固定 worker，避免每条报文都 Task.Run
 var cts = new CancellationTokenSource();
+var persistQueue = Channel.CreateBounded<ModbusPacket>(new BoundedChannelOptions(8192)
+{
+    FullMode = BoundedChannelFullMode.Wait,
+    SingleWriter = true,
+    SingleReader = false
+});
+
+var workers = Enumerable.Range(0, 4)
+    .Select(_ => Task.Run(async () =>
+    {
+        await foreach (var pkt in persistQueue.Reader.ReadAllAsync(cts.Token))
+        {
+            await PersistPacketAsync(pkt);
+        }
+    }, cts.Token))
+    .ToArray();
+
 try
 {
     await foreach (var pkt in modbusHandler.ReadParsedPacketsAsync(cts.Token))
     {
-        // 异步写入数据库或队列（避免阻塞解析线程）
-        _ = Task.Run(() => PersistPacketAsync(pkt));
+        await persistQueue.Writer.WriteAsync(pkt, cts.Token);
     }
 }
 catch (OperationCanceledException) { }
+finally
+{
+    persistQueue.Writer.TryComplete();
+    await Task.WhenAll(workers);
+}
 ```
 
 2) 事件订阅（轻量，同步通知）
@@ -79,6 +100,31 @@ protected override void OnParsed(ModbusPacket pkt)
 ```
 
 要点：
-- 若使用 `ReadParsedPacketsAsync`，请传入 `CancellationToken` 并确保消费者能跟上生产速率；否者可能触发通道丢包（默认是 DropOldest）。
+- 若使用 `ReadParsedPacketsAsync`，请传入 `CancellationToken` 并确保消费者能跟上生产速率；否则可能触发通道丢包（默认是 DropOldest）。
 - `OnHandleChanged` 回调可能在解析线程触发；若在 UI 使用需切换线程上下文。
-- 覆写 `OnParsed` 为最高性能路径，但不应做阻塞操作。
+- 不建议对每条报文执行 `_ = Task.Run(...)`；高吞吐长跑下容易造成任务堆积、线程池抖动和后续超时。
+
+## 配置片段（appsettings.json 示例）
+
+```json
+{
+  "SerialPortService": {
+    "GenericHandlerOptions": {
+      "ResponseChannelCapacity": 4096,
+      "ResponseChannelFullMode": "Wait",
+      "WaitModeQueueCapacity": 8192,
+      "DropWhenNoActiveRequest": false,
+      "SampleLogInterval": 200,
+      "ReconnectIntervalMs": 1000,
+      "MaxReconnectAttempts": 5,
+      "WaitBacklogAlertThreshold": 2048
+    }
+  }
+}
+```
+
+示例：在 .NET 启动代码中绑定配置并注入：
+
+```csharp
+var options = configuration.GetSection("SerialPortService:GenericHandlerOptions").Get<GenericHandlerOptions>();
+var handler = new ModbusHandler("COM3", 9600, Parity.None, 8, StopBits.One, logger, options);

@@ -249,6 +249,9 @@ namespace SerialPortService.Services.Handler
                 Interlocked.Read(ref _waitModeQueueLength),
                 Interlocked.Read(ref _waitModeQueueHighWatermark));
 
+        public long GetParsedPacketDropCount()
+            => Interlocked.Read(ref _parsedPacketDropCount);
+
         /// <summary>
         /// 读取解析完成的业务报文流。
         /// 解析线程产出完整对象后写入通道，业务线程可独立异步消费。

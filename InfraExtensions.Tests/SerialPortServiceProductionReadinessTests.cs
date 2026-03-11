@@ -238,6 +238,7 @@ public class SerialPortServiceProductionReadinessTests
     {
         private bool _opened;
         private readonly bool _throwOnSend;
+        private bool _lastCloseSucceeded = true;
 
         public FakePortContext(string name, bool throwOnSend)
         {
@@ -251,7 +252,11 @@ public class SerialPortServiceProductionReadinessTests
 
         public void Open() => _opened = true;
 
-        public void Close() => _opened = false;
+        public void Close()
+        {
+            _opened = false;
+            _lastCloseSucceeded = true;
+        }
 
         public Task<byte[]> Send(byte[] data)
         {
@@ -271,7 +276,10 @@ public class SerialPortServiceProductionReadinessTests
         public void Dispose()
         {
             _opened = false;
+            _lastCloseSucceeded = true;
         }
+
+        public bool LastCloseSucceeded => _lastCloseSucceeded;
     }
 
     private sealed class DummyStringParser : IStreamParser<string>

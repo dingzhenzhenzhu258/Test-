@@ -1,4 +1,6 @@
-﻿using SerialPortService.Models;
+﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using SerialPortService.Models;
 using SerialPortService.Models.Emuns;
 using SerialPortService.Services.Handler;
 using SerialPortService.Services.Interfaces;
@@ -11,8 +13,6 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SerialPortService.Services
 {
@@ -37,7 +37,7 @@ namespace SerialPortService.Services
 
         private readonly ILoggerFactory _loggerFactory;
         private readonly GenericHandlerOptions _genericHandlerOptions;
-        private readonly ILogger _logger;
+        private readonly Microsoft.Extensions.Logging.ILogger _logger;
         private static readonly ConcurrentDictionary<HandleEnum, ISerialPortService.PortContextFactory> handlerFactories = new();
         private static Func<HandleEnum, ProtocolEnum>? protocolResolver;
         private static PortBinding? configuredReconnectPolicy;
@@ -343,63 +343,79 @@ namespace SerialPortService.Services
         /// </summary>
         /// <param name="portName"></param>
         /// <returns></returns>
-        public OperateResult ClosePort(string portName)
+        public async Task<OperateResult> ClosePortAsync(string portName)
         {
             IPortContext? context;
             PortBinding? bindingSnapshot = null;
+
+            // 步骤1：原子化摘除（防止后续 50ms 的采集任务还能拿到这个句柄）
             lock (portOpenCloseLock)
             {
-                // 步骤1：先移除字典项再关闭。
-                // 为什么：先摘除可阻止并发发送拿到即将关闭的上下文。
-                // 风险点：若先关闭再移除，可能出现并发“写到关闭中的端口”。
                 if (!ports.TryRemove(portName, out context))
+                {
                     return new OperateResult(false, $"未找到串口 {portName}", -1);
+                }
 
-                // 步骤2：清理绑定快照。
-                // 为什么：关闭后应允许按新参数重新打开同名端口。
-                // 风险点：不清理会导致后续重开误判参数冲突。
                 if (portBindings.TryGetValue(portName, out var binding))
                 {
                     bindingSnapshot = binding;
                 }
                 portBindings.TryRemove(portName, out _);
-
             }
 
-            // 步骤3：在锁外执行关闭与释放。
-            // 为什么：避免关闭过程阻塞全局端口开关锁，降低“超时场景关窗卡死”概率。
-            // 风险点：若在锁内执行耗时 IO，可能造成其他端口操作长期等待。
+            // 步骤2：强制执行物理关闭（移出 UI 线程防止界面卡死）
             try
             {
-                context!.Close();
-                context.Dispose();
+                var closeTask = Task.Run(() =>
+                {
+                    try
+                    {
+                        // 如果 context 内部能访问到 BaseStream，直接 Dispose 它
+                        // 这比任何 Discard 都管用，它会强制 Windows 撤销所有 pending 的 IO 请求
+                        context?.Close();
+                        context?.Dispose();
+                        return true;
+                    }
+                    catch (Exception ex)
+                    { 
+
+                        // 使用你的 LoggerHelper 扩展方法
+                        _logger.AddLog(
+                            level: LogLevel.Error,
+                            messageTemplate: "串口 {PortName} 物理关闭异常",
+                            isShowUI: false,          
+                            exception: ex,           // 极其重要！传入这个 ex 才能在 OpenObserve 看到堆栈 [cite: 10]
+                            args: ex.Message         // 结构化参数
+                        );
+                        return false;
+                    }
+                });
+
+                // 3秒硬超时：专门对付那条“第67万条报文”引发的驱动层死锁
+                if (await Task.WhenAny(closeTask, Task.Delay(3000)) != closeTask)
+                {
+                    // 使用你的 LoggerHelper 扩展方法
+                    _logger.AddLog(
+                        level: LogLevel.Warning,
+                        messageTemplate: "警告：串口 {PortName} 驱动响应超时。已强行剥离逻辑关联，防止界面挂起。",
+                        isShowUI: false,          
+                        args: portName         // 结构化参数
+                    );
+                    // 注意：绝不执行 TryAdd 回滚，坏掉的串口必须从系统中彻底剔除
+                    return new OperateResult(false, $"{portName} 驱动死锁：已强制放弃句柄", -2);
+                }
             }
             catch (Exception ex)
             {
-                lock (portOpenCloseLock)
-                {
-                    ports.TryAdd(portName, context!);
-                    if (bindingSnapshot.HasValue)
-                    {
-                        portBindings.TryAdd(portName, bindingSnapshot.Value);
-                    }
-                }
-
+                // 使用你的 LoggerHelper 扩展方法
+                _logger.AddLog(
+                    level: LogLevel.Error,
+                    messageTemplate: "关闭串口 {PortName} 时触发未知错误",
+                    isShowUI: false,
+                    exception: ex,           // 极其重要！传入这个 ex 才能在 OpenObserve 看到堆栈 [cite: 10]
+                    args: ex.Message         // 结构化参数
+                );
                 return new OperateResult(false, $"{portName} 关闭失败: {ex.Message}", -1);
-            }
-
-            if (!context!.LastCloseSucceeded)
-            {
-                lock (portOpenCloseLock)
-                {
-                    ports.TryAdd(portName, context);
-                    if (bindingSnapshot.HasValue)
-                    {
-                        portBindings.TryAdd(portName, bindingSnapshot.Value);
-                    }
-                }
-
-                return new OperateResult(false, $"{portName} 关闭未完成：底层串口句柄可能仍被占用", -1);
             }
 
             return new OperateResult(true, $"{portName} 关闭成功", 0);

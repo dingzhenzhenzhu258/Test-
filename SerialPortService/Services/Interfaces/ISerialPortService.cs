@@ -38,7 +38,7 @@ namespace SerialPortService.Services.Interfaces
         /// <summary>
         /// 关闭串口
         /// </summary>
-        OperateResult ClosePort(string portName);
+        Task<OperateResult> ClosePortAsync(string portName);
 
         /// <summary>
         /// 关闭所有已打开串口。
