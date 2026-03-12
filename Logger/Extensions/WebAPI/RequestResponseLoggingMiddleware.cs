@@ -18,7 +18,14 @@ namespace Logger.Extensions.WebAPI
     /// </summary>
     public class RequestResponseLoggingMiddleware
     {
+        /// <summary>
+        /// 下一个中间件委托。
+        /// </summary>
         private readonly RequestDelegate _next;
+
+        /// <summary>
+        /// 当前中间件日志实例。
+        /// </summary>
         private readonly ILogger<RequestResponseLoggingMiddleware> _logger;
 
         /// <summary>
@@ -114,7 +121,10 @@ namespace Logger.Extensions.WebAPI
         }
     }
 
-    // 提供一个优雅的扩展方法
+    /// <summary>
+    /// 请求响应日志中间件扩展。
+    /// 用于以扩展方法方式注册 <see cref="RequestResponseLoggingMiddleware"/>。
+    /// </summary>
     public static class RequestResponseLoggingExtensions
     {
         /// <summary>

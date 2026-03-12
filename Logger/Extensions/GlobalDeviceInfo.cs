@@ -35,6 +35,9 @@ namespace Logger.Extensions
         /// </summary>
         public static string MacAddress => GetMacAddress();
 
+        /// <summary>
+        /// 获取本机首个可用 IPv4 地址。
+        /// </summary>
         private static string GetLocalIPv4()
         {
             try
@@ -55,6 +58,9 @@ namespace Logger.Extensions
             return "Unknown IP";
         }
 
+        /// <summary>
+        /// 获取本机首个可用网卡的 MAC 地址。
+        /// </summary>
         private static string GetMacAddress()
         {
             try

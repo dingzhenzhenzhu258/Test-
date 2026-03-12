@@ -32,11 +32,38 @@ namespace Logger.Extensions
     /// </summary>
     public static class LoggerExtensions
     {
+        /// <summary>
+        /// 标记 SelfLog 是否已完成一次性挂载。
+        /// 0 表示未挂载，1 表示已挂载。
+        /// </summary>
         private static int _selfLogHooked;
+
+        /// <summary>
+        /// 标记 OTLP 异常告警是否已触发。
+        /// 用于抑制重复告警风暴。
+        /// </summary>
         private static int _otlpAlertRaised;
+
+        /// <summary>
+        /// SelfLog 关键字过滤集合。
+        /// 仅命中关键字的消息才会进入 OTLP 异常告警流程。
+        /// </summary>
         private static string[] _otlpSelfLogKeywords = new[] { "opentelemetry", "otlp", "5080" };
+
+        /// <summary>
+        /// 标记恢复探测告警是否已输出。
+        /// 0 表示未通知，1 表示已通知。
+        /// </summary>
         private static int _otlpRecoveryNotified;
+
+        /// <summary>
+        /// OTLP 恢复探测定时器。
+        /// </summary>
         private static Timer? _otlpRecoveryTimer;
+
+        /// <summary>
+        /// 保护恢复探测定时器生命周期的互斥锁。
+        /// </summary>
         private static readonly object otlpRecoveryTimerLock = new();
 
         /// <summary>
