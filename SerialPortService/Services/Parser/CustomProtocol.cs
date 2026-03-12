@@ -70,12 +70,12 @@ namespace SerialPortService.Services.Parser
         /// <summary>
         /// 输入单字节并尝试输出完整帧。
         /// </summary>
-        public bool TryParse(byte b, out CustomFrame? result)
+        public bool TryParse(byte b, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out CustomFrame result)
         {
             // 步骤1：默认置空解析结果。
             // 为什么：只有完整帧通过校验才允许输出对象。
             // 风险点：若复用旧 result，可能把上一次解析结果误返回。
-            result = null;
+            result = null!;
 
             // 步骤2：按状态机消费字节流。
             // 为什么：串口数据天然分片，需要逐字节累积协议上下文。

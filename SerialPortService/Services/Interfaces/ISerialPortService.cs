@@ -73,8 +73,22 @@ namespace SerialPortService.Services.Interfaces
         /// <returns></returns>
         bool IsOpen(string portName);
 
+        /// <summary>
+        /// 异常语义（必须成功）端口不存在或发送失败会抛异常，返回值是底层 IPortContext.Send 的回显字节数组
+        /// </summary>
+        /// <param name="portName"></param>
+        /// <param name="data"></param>
+        /// <returns></returns>
         Task<byte[]> Write(string portName, byte[] data);
 
+        /// <summary>
+        /// 遇到高吞吐/超时问题，优先使用 TryWrite 并结合重试/退避与上面文档中的消费/通道调优建议
+        /// 结果语义（推荐用于生产）
+        /// 不会抛异常，返回 OperateResult<byte[]>；IsSuccess 表示是否发送成功，Content 为回显数据，Message 包含失败原因（例如“未打开”或“发送失败”）。
+        /// </summary>
+        /// <param name="portName"></param>
+        /// <param name="data"></param>
+        /// <returns></returns>
         Task<OperateResult<byte[]>> TryWrite(string portName, byte[] data);
     }
 }

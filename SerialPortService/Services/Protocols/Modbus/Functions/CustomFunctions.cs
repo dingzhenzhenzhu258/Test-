@@ -38,4 +38,6 @@ namespace SerialPortService.Services.Protocols.Modbus.Functions
         public override int LengthByteIndex => 3;
         public override int HeaderLength => 4;
     }
+
+
 }

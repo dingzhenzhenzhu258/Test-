@@ -64,7 +64,8 @@ namespace Logger.Helpers
             using (LogContext.PushProperty("FilePath", sourceFilePath))
             using (LogContext.PushProperty("LineNumber", sourceLineNumber))
             {
-                logger.Log(level, exception, messageTemplate, args);
+                // 步骤1：确保 args 不为 null 以避免 CS8604 警告，风险点：显式传递 null 会导致异常
+                logger.Log(level, exception, messageTemplate, args ?? Array.Empty<object>());
             }
         }
     }
