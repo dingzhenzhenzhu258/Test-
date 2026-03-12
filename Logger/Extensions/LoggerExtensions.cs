@@ -16,6 +16,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -33,6 +34,10 @@ namespace Logger.Extensions
     {
         private static int _selfLogHooked;
         private static int _otlpAlertRaised;
+        private static string[] _otlpSelfLogKeywords = new[] { "opentelemetry", "otlp", "5080" };
+        private static int _otlpRecoveryNotified;
+        private static Timer? _otlpRecoveryTimer;
+        private static readonly object otlpRecoveryTimerLock = new();
 
         /// <summary>
         /// 确保 appsettings.json 配置文件存在。
@@ -137,6 +142,25 @@ namespace Logger.Extensions
             // 1. 准备认证信息 (保留了你原本的账号密码组合) 
             var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes("admin@example.com:Kb123456@")); 
 
+            // 步骤1：统一读取 OTLP 端点并决定是否启用远端导出。
+            // 为什么：当日志服务器不可达时可在启动期直接降级，减少无效重试开销。
+            // 风险点：若端点配置错误且仍强制导出，会持续消耗线程/网络资源。
+            var otlpLogsEndpoint = configuration["Logger:Otlp:LogsEndpoint"] ?? "http://localhost:5080/api/default/v1/logs";
+            var otlpTracesEndpoint = configuration["Logger:Otlp:TracesEndpoint"] ?? "http://localhost:5080/api/default/v1/traces";
+            var otlpMetricsEndpoint = configuration["Logger:Otlp:MetricsEndpoint"] ?? "http://localhost:5080/api/default/v1/metrics";
+
+            // 步骤1.1：刷新 SelfLog 关键字，兼容自定义 OTLP 端点。
+            // 为什么：SelfLog 告警过滤不能硬编码 5080，需要跟随配置变化。
+            // 风险点：关键字未更新会导致真实导出错误被误判为无关日志。
+            UpdateOtlpSelfLogKeywords(otlpLogsEndpoint, otlpTracesEndpoint, otlpMetricsEndpoint);
+
+            // 步骤1.2：统一计算 Telemetry 导出器启用策略。
+            // 为什么：Tracing/Metrics 可在端点恢复后自动继续上报，无需额外重建。
+            // 风险点：若关闭该策略，Telemetry 需重启应用后才会恢复导出。
+            var otlpEnabled = ShouldEnableOtlp(configuration, out var otlpDisabledReason, otlpLogsEndpoint, otlpTracesEndpoint, otlpMetricsEndpoint);
+            var autoRecoverTelemetry = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForTelemetry") ?? true;
+            var enableTelemetryExporters = otlpEnabled || autoRecoverTelemetry;
+
             // 2. 创建统一的资源标签 (Logs 和 Traces 共享)
             var resourceAttributes = new Dictionary<string, object>
             {
@@ -152,37 +176,22 @@ namespace Logger.Extensions
             // ==========================================
             // 模块 A: 配置 Serilog (全权负责处理 Logs)
             // ==========================================
-            var loggerConfig = new LoggerConfiguration()
-                .ReadFrom.Configuration(configuration)
-                // 【关键新增】挂载全局动态开关
-                .MinimumLevel.ControlledBy(LoggerLevelManager.LogSwitch)
-                .Enrich.FromLogContext()
-                .Enrich.WithExceptionDetails()
-                // ==========================================
-                // 【新增】全局静态属性注入（彻底焊死，无视线程切换）
-                .Enrich.WithProperty("MachineName", GlobalDeviceInfo.MachineName)
-                .Enrich.WithProperty("AppVersion", GlobalDeviceInfo.AppVersion)
-                .Enrich.WithProperty("IPAddress", GlobalDeviceInfo.IpAddress)
-                .Enrich.WithProperty("MACAddress", GlobalDeviceInfo.MacAddress)
-                // ==========================================
-                .WriteTo.Console()
-                .WriteTo.File(
-                    path: Path.Combine("logs", "fallback.log"),
-                    rollingInterval: RollingInterval.Day,
-                    retainedFileCountLimit: 14,
-                    shared: true)
-                // 将日志推送到 OpenObserve (完全替代了原先错误的 builder.Logging.AddOpenTelemetry)
-                .WriteTo.OpenTelemetry(options =>
-                {
-                    options.Endpoint = "http://localhost:5080/api/default/v1/logs"; // 
-                    options.Protocol = OtlpProtocol.HttpProtobuf; // 
-                    options.Headers = new Dictionary<string, string> { ["Authorization"] = $"Basic {credentials}" }; // 
-                    options.ResourceAttributes = resourceAttributes;
+            var loggerConfig = CreateLoggerConfiguration(configuration, resourceAttributes, credentials, otlpLogsEndpoint, otlpEnabled);
 
-                    // 完美还原你的高频推送配置
-                    options.BatchingOptions.BatchSizeLimit = 10; // 
-                    options.BatchingOptions.BufferingTimeLimit = TimeSpan.FromMilliseconds(500); // 
-                });
+            if (!otlpEnabled)
+            {
+                WriteOtlpFallbackNotice($"启动时已禁用 OTLP 导出，仅保留本地日志。原因: {otlpDisabledReason}");
+
+                if (autoRecoverTelemetry)
+                {
+                    WriteOtlpFallbackNotice("Tracing/Metrics 导出器已保持启用状态，待 OTLP 端点恢复后将自动恢复上报。");
+                }
+
+                // 步骤3：启动后台恢复探测与日志热恢复。
+                // 为什么：服务恢复后可自动恢复日志上报，减少人工干预。
+                // 风险点：若日志热恢复失败，将继续停留在本地日志兜底模式。
+                StartOtlpRecoveryMonitor(configuration, credentials, resourceAttributes, otlpLogsEndpoint, otlpTracesEndpoint, otlpMetricsEndpoint);
+            }
 
             Log.Logger = loggerConfig.CreateLogger();
 
@@ -190,7 +199,7 @@ namespace Logger.Extensions
             services.AddLogging(loggingBuilder =>
             {
                 loggingBuilder.ClearProviders();
-                loggingBuilder.AddSerilog(Log.Logger, dispose: true);
+                loggingBuilder.AddSerilog(dispose: true);
             });
 
             // 【新增】显式设置全局传播器为 W3C 标准（确保跨端 ID 一致）
@@ -213,12 +222,15 @@ namespace Logger.Extensions
                             tracingBuilder.AddAspNetCoreInstrumentation();
                         }
 
-                        tracingBuilder.AddOtlpExporter(opts =>
+                        if (enableTelemetryExporters)
                         {
-                            opts.Endpoint = new Uri("http://localhost:5080/api/default/v1/traces");
-                            opts.Headers = $"Authorization=Basic {credentials}";
-                            opts.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.HttpProtobuf;
-                        });
+                            tracingBuilder.AddOtlpExporter(opts =>
+                            {
+                                opts.Endpoint = new Uri(otlpTracesEndpoint);
+                                opts.Headers = $"Authorization=Basic {credentials}";
+                                opts.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.HttpProtobuf;
+                            });
+                        }
                     })
                     .WithMetrics(metricsBuilder =>
                     {
@@ -233,18 +245,284 @@ namespace Logger.Extensions
                             metricsBuilder.AddAspNetCoreInstrumentation(); // 收集 API 的 QPS 指标
                         }
 
-                        metricsBuilder.AddOtlpExporter(opts =>
+                        if (enableTelemetryExporters)
                         {
-                            opts.Endpoint = new Uri("http://localhost:5080/api/default/v1/metrics");
-                            opts.Headers = $"Authorization=Basic {credentials}";
-                            opts.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.HttpProtobuf;
-                        });
+                            metricsBuilder.AddOtlpExporter(opts =>
+                            {
+                                opts.Endpoint = new Uri(otlpMetricsEndpoint);
+                                opts.Headers = $"Authorization=Basic {credentials}";
+                                opts.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.HttpProtobuf;
+                            });
+                        }
                     });
 
             // 注意：不要在专门配日志的扩展方法里注册 Controllers 或 HttpClient。
             // 那些应该由主程序的 Program.cs 自己去注册。
 
             return services; 
+        }
+
+        /// <summary>
+        /// 启动 OTLP 恢复探测定时器，检测到恢复后输出提示。
+        /// </summary>
+        private static void StartOtlpRecoveryMonitor(IConfiguration configuration, string credentials, IDictionary<string, object> resourceAttributes, string otlpLogsEndpoint, params string[] endpoints)
+        {
+            var autoRecover = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverProbe") ?? true;
+            if (!autoRecover)
+            {
+                return;
+            }
+
+            var intervalMs = Math.Clamp(configuration.GetValue<int?>("Logger:Otlp:AutoRecoverProbeIntervalMs") ?? 30000, 1000, 300000);
+            var timeoutMs = Math.Clamp(configuration.GetValue<int?>("Logger:Otlp:ProbeTimeoutMs") ?? 200, 50, 5000);
+
+            lock (otlpRecoveryTimerLock)
+            {
+                Interlocked.Exchange(ref _otlpRecoveryNotified, 0);
+                _otlpRecoveryTimer?.Dispose();
+                _otlpRecoveryTimer = new Timer(_ =>
+                {
+                    // 步骤1：周期检查端点连通性。
+                    // 为什么：服务可能在应用启动后才恢复可用。
+                    // 风险点：频率过高会产生无意义探测流量。
+                    var recovered = endpoints.All(endpoint => IsEndpointReachable(endpoint, timeoutMs));
+                    if (!recovered)
+                    {
+                        return;
+                    }
+
+                    if (Interlocked.CompareExchange(ref _otlpRecoveryNotified, 1, 0) != 0)
+                    {
+                        return;
+                    }
+
+                    // 步骤2：可选执行日志导出热恢复。
+                    // 为什么：端点恢复后让 Logs/Tracing/Metrics 尽量统一进入自动恢复态。
+                    // 风险点：若日志器重建失败，日志仍仅写本地兜底文件。
+                    var applyForLogs = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForLogs") ?? true;
+                    var applyForTelemetry = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForTelemetry") ?? true;
+                    if (applyForLogs)
+                    {
+                        try
+                        {
+                            var newLogger = CreateLoggerConfiguration(configuration, resourceAttributes, credentials, otlpLogsEndpoint, enableOtlp: true)
+                                .CreateLogger();
+                            var oldLogger = Log.Logger;
+                            Log.Logger = newLogger;
+                            (oldLogger as IDisposable)?.Dispose();
+                            var telemetryTip = applyForTelemetry
+                                ? "Tracing/Metrics 导出器已保持启用，端点恢复后会自动继续上报。"
+                                : "Tracing/Metrics 未启用自动恢复，需重启应用后生效。";
+                            WriteOtlpFallbackNotice($"检测到 OTLP 端点已恢复可用，日志导出已自动恢复。{telemetryTip}");
+                        }
+                        catch (Exception ex)
+                        {
+                            WriteOtlpFallbackNotice($"OTLP 日志导出热恢复失败：{ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        var logTip = "日志导出未配置自动热恢复，需重启应用后生效。";
+                        var telemetryTip = applyForTelemetry
+                            ? "Tracing/Metrics 导出器已保持启用，端点恢复后会自动继续上报。"
+                            : "Tracing/Metrics 未启用自动恢复，需重启应用后生效。";
+                        WriteOtlpFallbackNotice($"检测到 OTLP 端点已恢复可用。{logTip}{telemetryTip}");
+                    }
+
+                    lock (otlpRecoveryTimerLock)
+                    {
+                        _otlpRecoveryTimer?.Dispose();
+                        _otlpRecoveryTimer = null;
+                    }
+                }, null, intervalMs, intervalMs);
+            }
+        }
+
+        /// <summary>
+        /// 创建 Serilog 配置，按开关决定是否挂载 OTLP 日志导出器。
+        /// </summary>
+        private static LoggerConfiguration CreateLoggerConfiguration(
+            IConfiguration configuration,
+            IDictionary<string, object> resourceAttributes,
+            string credentials,
+            string otlpLogsEndpoint,
+            bool enableOtlp)
+        {
+            var loggerConfig = new LoggerConfiguration()
+                .ReadFrom.Configuration(configuration)
+                .MinimumLevel.ControlledBy(LoggerLevelManager.LogSwitch)
+                .Enrich.FromLogContext()
+                .Enrich.WithExceptionDetails()
+                .Enrich.WithProperty("MachineName", GlobalDeviceInfo.MachineName)
+                .Enrich.WithProperty("AppVersion", GlobalDeviceInfo.AppVersion)
+                .Enrich.WithProperty("IPAddress", GlobalDeviceInfo.IpAddress)
+                .Enrich.WithProperty("MACAddress", GlobalDeviceInfo.MacAddress)
+                .WriteTo.Console()
+                .WriteTo.File(
+                    path: Path.Combine("logs", "fallback.log"),
+                    rollingInterval: RollingInterval.Day,
+                    retainedFileCountLimit: 14,
+                    shared: true);
+
+            if (enableOtlp)
+            {
+                loggerConfig = loggerConfig.WriteTo.OpenTelemetry(options =>
+                {
+                    options.Endpoint = otlpLogsEndpoint;
+                    options.Protocol = OtlpProtocol.HttpProtobuf;
+                    options.Headers = new Dictionary<string, string> { ["Authorization"] = $"Basic {credentials}" };
+                    options.ResourceAttributes = resourceAttributes;
+                    options.BatchingOptions.BatchSizeLimit = 10;
+                    options.BatchingOptions.BufferingTimeLimit = TimeSpan.FromMilliseconds(500);
+                });
+            }
+
+            return loggerConfig;
+        }
+
+        /// <summary>
+        /// 根据当前 OTLP 配置构建 SelfLog 过滤关键字。
+        /// </summary>
+        private static void UpdateOtlpSelfLogKeywords(params string[] endpoints)
+        {
+            var keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "opentelemetry",
+                "otlp"
+            };
+
+            foreach (var endpoint in endpoints)
+            {
+                if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(uri.Host))
+                {
+                    keywords.Add(uri.Host.ToLowerInvariant());
+                }
+
+                if (!uri.IsDefaultPort)
+                {
+                    keywords.Add(uri.Port.ToString());
+                }
+
+                var lastPathSegment = uri.AbsolutePath
+                    .Split('/', StringSplitOptions.RemoveEmptyEntries)
+                    .LastOrDefault();
+
+                if (!string.IsNullOrWhiteSpace(lastPathSegment))
+                {
+                    keywords.Add(lastPathSegment.ToLowerInvariant());
+                }
+            }
+
+            _otlpSelfLogKeywords = keywords.ToArray();
+        }
+
+        /// <summary>
+        /// 根据配置与启动探测结果决定是否启用 OTLP 远端导出。
+        /// </summary>
+        private static bool ShouldEnableOtlp(IConfiguration configuration, out string reason, params string[] endpoints)
+        {
+            // 步骤1：读取显式开关。
+            // 为什么：允许生产环境快速一键禁用远端导出。
+            // 风险点：若误关开关，将只保留本地日志与本地指标处理。
+            var enabled = configuration.GetValue<bool?>("Logger:Otlp:Enabled") ?? true;
+            if (!enabled)
+            {
+                reason = "Logger:Otlp:Enabled=false";
+                return false;
+            }
+
+            // 步骤2：按配置决定是否做启动探测。
+            // 为什么：本地调试场景常见服务未启动，提前降级可减少后续失败重试。
+            // 风险点：若关闭探测，服务不可达时仍会走导出重试路径。
+            var probeOnStartup = configuration.GetValue<bool?>("Logger:Otlp:ProbeOnStartup") ?? true;
+            if (!probeOnStartup)
+            {
+                reason = string.Empty;
+                return true;
+            }
+
+            var timeoutMs = Math.Clamp(configuration.GetValue<int?>("Logger:Otlp:ProbeTimeoutMs") ?? 200, 50, 5000);
+            var unreachable = endpoints.FirstOrDefault(endpoint => !IsEndpointReachable(endpoint, timeoutMs));
+            if (!string.IsNullOrWhiteSpace(unreachable))
+            {
+                reason = $"Endpoint unreachable: {unreachable}";
+                return false;
+            }
+
+            reason = string.Empty;
+            return true;
+        }
+
+        /// <summary>
+        /// 记录 OTLP 降级提示，避免误以为远端日志已成功上报。
+        /// </summary>
+        private static void WriteOtlpFallbackNotice(string message)
+        {
+            var alert = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [Logger] {message}{Environment.NewLine}";
+            try
+            {
+                var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+                Directory.CreateDirectory(logDir);
+                File.AppendAllText(Path.Combine(logDir, "fallback.log"), alert, Encoding.UTF8);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Console.Error.WriteLine(alert);
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>
+        /// 仅对本地地址执行轻量连通性探测，远端地址默认放行。
+        /// </summary>
+        private static bool IsEndpointReachable(string endpoint, int timeoutMs)
+        {
+            if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
+            {
+                return false;
+            }
+
+            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            // 步骤1：仅探测本机地址。
+            // 为什么：避免启动阶段因外网 DNS/网络抖动造成额外等待。
+            // 风险点：远端地址不可达将不会被启动探测拦截。
+            if (!string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(uri.Host, "::1", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var port = uri.IsDefaultPort
+                ? (string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ? 443 : 80)
+                : uri.Port;
+
+            try
+            {
+                using var tcpClient = new TcpClient();
+                var connectTask = tcpClient.ConnectAsync(uri.Host, port);
+                return connectTask.Wait(timeoutMs) && tcpClient.Connected;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         /// <summary>
@@ -265,7 +543,8 @@ namespace Logger.Extensions
                 }
 
                 var lower = message?.ToLowerInvariant() ?? string.Empty;
-                if (!lower.Contains("opentelemetry") && !lower.Contains("otlp") && !lower.Contains("5080"))
+                var hit = _otlpSelfLogKeywords.Any(k => lower.Contains(k));
+                if (!hit)
                 {
                     Interlocked.Exchange(ref _otlpAlertRaised, 0);
                     return;

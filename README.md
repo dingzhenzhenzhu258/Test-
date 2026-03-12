@@ -41,6 +41,21 @@ var response = await modbusContext.SendRequestAsync(command, timeout: 3000, retr
 配置
 - 日志、OpenTelemetry、设备配置等可通过 `Logger/appsettings.json` 与 `SerialPortService/appsettings.serialport.*.json`（样例）进行调整。
 
+日志可用性与自动恢复（OTLP）
+- `Logger` 模块支持“启动探测 + 自动降级 + 自动恢复”：
+  - 启动时不可达：日志自动降级到本地 `logs/fallback.log`；
+  - 端点恢复后：可自动恢复远端日志上报；
+  - `Tracing/Metrics` 可按配置保持导出器启用，端点恢复后自动继续上报。
+- 关键配置位于 `Logger/appsettings.json`：
+  - `Logger:Otlp:Enabled`：是否启用 OTLP 能力；
+  - `Logger:Otlp:ProbeOnStartup`：是否在启动阶段探测可达性；
+  - `Logger:Otlp:ProbeTimeoutMs`：探测超时时间；
+  - `Logger:Otlp:AutoRecoverProbe`：是否启用后台恢复探测；
+  - `Logger:Otlp:AutoRecoverProbeIntervalMs`：恢复探测周期；
+  - `Logger:Otlp:AutoRecoverApplyForLogs`：端点恢复后是否自动热恢复日志上报；
+  - `Logger:Otlp:AutoRecoverApplyForTelemetry`：`Tracing/Metrics` 是否保持自动恢复策略；
+  - `Logger:Otlp:LogsEndpoint/TracesEndpoint/MetricsEndpoint`：各链路 OTLP 端点。
+
 代码约定与开发注意事项
 - 注释风格：使用项目约定的“步骤编号 + 为什么 + 风险点”注释模板来说明实现动机与风险点。
 - 扩展方法：若调用 `LoggerHelper.AddLog` 等扩展方法，请确保引用 `using Logger.Helpers;`。
