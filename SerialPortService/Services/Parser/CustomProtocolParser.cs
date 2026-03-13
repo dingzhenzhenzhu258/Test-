@@ -1,40 +1,10 @@
+using SerialPortService.Models;
 using SerialPortService.Services.Interfaces;
 using System;
 using System.Collections.Generic;
 
 namespace SerialPortService.Services.Parser
 {
-    /// <summary>
-    /// 自定义协议帧对象。
-    /// </summary>
-    public sealed class CustomFrame
-    {
-        /// <summary>
-        /// 初始化协议帧。
-        /// </summary>
-        public CustomFrame(byte command, byte[] payload, byte[] raw)
-        {
-            Command = command;
-            Payload = payload;
-            Raw = raw;
-        }
-
-        /// <summary>
-        /// 命令字。
-        /// </summary>
-        public byte Command { get; }
-
-        /// <summary>
-        /// 负载数据。
-        /// </summary>
-        public byte[] Payload { get; }
-
-        /// <summary>
-        /// 原始完整帧。
-        /// </summary>
-        public byte[] Raw { get; }
-    }
-
     /// <summary>
     /// 自定义协议状态机解析器。
     /// 帧格式：AA | Length | Command | Payload | Checksum | 55。
@@ -45,9 +15,6 @@ namespace SerialPortService.Services.Parser
         private const byte Tail = 0x55;
         private const int MaxLength = 64;
 
-        /// <summary>
-        /// 解析状态。
-        /// </summary>
         private enum State
         {
             WaitHeader,
@@ -67,9 +34,6 @@ namespace SerialPortService.Services.Parser
         private readonly List<byte> _payload = new();
         private readonly List<byte> _raw = new();
 
-        /// <summary>
-        /// 输入单字节并尝试输出完整帧。
-        /// </summary>
         public bool TryParse(byte b, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out CustomFrame result)
         {
             // 步骤1：默认置空解析结果。
@@ -86,12 +50,7 @@ namespace SerialPortService.Services.Parser
                     // 步骤2.1：等待帧头。
                     // 为什么：从随机字节流中重新对齐协议边界。
                     // 风险点：若不校验帧头，后续长度字段将不可置信。
-                    if (b == Header)
-                    {
-                        Reset();
-                        _raw.Add(b);
-                        _state = State.ReadLength;
-                    }
+                    if (b == Header) { Reset(); _raw.Add(b); _state = State.ReadLength; }
                     break;
 
                 case State.ReadLength:
@@ -100,11 +59,7 @@ namespace SerialPortService.Services.Parser
                     // 风险点：长度越界会导致内存扩张或状态机失控。
                     _length = b;
                     _raw.Add(b);
-                    if (_length < 1 || _length > MaxLength)
-                    {
-                        Reset();
-                        break;
-                    }
+                    if (_length < 1 || _length > MaxLength) { Reset(); break; }
                     _payloadRemaining = _length - 1;
                     _state = State.ReadCommand;
                     break;
@@ -123,23 +78,15 @@ namespace SerialPortService.Services.Parser
                     // 步骤2.4：逐字节累计负载并更新校验和。
                     // 为什么：支持任意分片到达的负载流。
                     // 风险点：负载计数不一致会造成后续字段错位。
-                    _payload.Add(b);
-                    _raw.Add(b);
-                    _checksumCalc ^= b;
-                    _payloadRemaining--;
-                    if (_payloadRemaining == 0)
-                    {
-                        _state = State.ReadChecksum;
-                    }
+                    _payload.Add(b); _raw.Add(b); _checksumCalc ^= b; _payloadRemaining--;
+                    if (_payloadRemaining == 0) _state = State.ReadChecksum;
                     break;
 
                 case State.ReadChecksum:
                     // 步骤2.5：读取校验字段。
                     // 为什么：下一个状态需进行完整帧有效性判定。
                     // 风险点：若跳过校验字段，错误数据会被当成合法帧。
-                    _checksum = b;
-                    _raw.Add(b);
-                    _state = State.ReadTail;
+                    _checksum = b; _raw.Add(b); _state = State.ReadTail;
                     break;
 
                 case State.ReadTail:
@@ -160,23 +107,13 @@ namespace SerialPortService.Services.Parser
             return false;
         }
 
-        /// <summary>
-        /// 重置状态机到初始状态。
-        /// </summary>
         public void Reset()
         {
             // 步骤1：恢复状态机到初始状态。
             // 为什么：为下一帧解析提供干净上下文。
             // 风险点：残留状态会污染下一次解析。
             _state = State.WaitHeader;
-            _length = 0;
-            _command = 0;
-            _payloadRemaining = 0;
-            _checksum = 0;
-            _checksumCalc = 0;
-            // 步骤2：清空缓存。
-            // 为什么：释放上一帧累积数据。
-            // 风险点：不清空会导致原始帧和负载混入下一帧。
+            _length = 0; _command = 0; _payloadRemaining = 0; _checksum = 0; _checksumCalc = 0;
             _payload.Clear();
             _raw.Clear();
         }
@@ -190,9 +127,6 @@ namespace SerialPortService.Services.Parser
         /// <summary>
         /// 构建一帧可发送的自定义协议报文。
         /// </summary>
-        /// <param name="command">命令字</param>
-        /// <param name="payload">负载数据，可为空</param>
-        /// <returns>完整报文字节数组</returns>
         public static byte[] Build(byte command, byte[] payload)
         {
             // 步骤1：标准化可空负载。
@@ -205,11 +139,7 @@ namespace SerialPortService.Services.Parser
             // 风险点：长度/校验错误会导致对端丢帧。
             var length = (byte)(1 + payload.Length);
             var checksum = (byte)(length ^ command);
-
-            foreach (var b in payload)
-            {
-                checksum ^= b;
-            }
+            foreach (var b in payload) checksum ^= b;
 
             // 步骤3：按协议格式组帧。
             // 为什么：保持发送报文与解析状态机一致。

@@ -1,10 +1,4 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
-namespace SerialPortService.Models.Emuns
+namespace SerialPortService.Models.Enums
 {
     /// <summary>
     /// 具体业务设备

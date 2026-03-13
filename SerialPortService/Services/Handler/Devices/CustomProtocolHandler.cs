@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using SerialPortService.Models;
 using SerialPortService.Services.Interfaces;
 using SerialPortService.Services.Parser;
 using System;

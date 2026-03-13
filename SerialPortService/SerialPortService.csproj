@@ -28,4 +28,8 @@
     <ProjectReference Include="..\Logger\Logger.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="Models\Emuns\" />
+  </ItemGroup>
+
 </Project>

@@ -1,5 +1,5 @@
 using SerialPortService.Models;
-using SerialPortService.Models.Emuns;
+using SerialPortService.Models.Enums;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;

@@ -1,4 +1,4 @@
-using SerialPortService.Services.Parser;
+using SerialPortService.Models;
 using System.Threading;
 using System.Threading.Tasks;
 

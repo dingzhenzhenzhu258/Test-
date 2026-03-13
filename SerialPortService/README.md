@@ -15,6 +15,40 @@
 - API + 使用文档：`docs/SerialPortService-API-Usage.md`
 - 指标看板与告警建议：`docs/SerialPortService-Metrics-Runbook.md`
 - 版本与兼容性说明：`docs/SerialPortService-Versioning.md`
+- 场景配置示例：`docs/SerialPortService-Scenario-Configs.md`
+
+---
+
+## 项目结构
+
+```
+SerialPortService/
+├── Extensions/                       # DI 注册扩展（AddSerialPortService）
+├── Helpers/                          # 工具方法（CRC 等）
+├── Models/
+│   ├── Enums/                        # 所有枚举（HandleEnum / ProtocolEnum / AlarmEnums 等）
+│   ├── Modbus/                       # Modbus 专属模型（ModbusPacket / ModbusException）
+│   ├── CustomFrame.cs                # 自定义协议帧
+│   ├── DataPacket.cs
+│   ├── OperateResult.cs
+│   └── ProtocolExceptions.cs         # 通用协议异常
+├── Services/
+│   ├── Handler/
+│   │   ├── Core/                     # 基础设施（GenericHandler / ParserPortContext / IResponseMatcher / Options）
+│   │   ├── Devices/                  # 具体设备处理器（ModbusHandler / AudibleVisualAlarmHandler 等）
+│   │   └── Metrics/                  # 指标快照、发布器、提供者接口（全 internal）
+│   ├── Interfaces/                   # ISerialPortService / IPortContext / IStreamParser 等
+│   ├── Parser/                       # 协议解析器（ModbusRtuParser / BarcodeParser / CustomProtocolParser 等）
+│   ├── Protocols/Modbus/Functions/   # Modbus 功能码帧构建
+│   ├── PortContext.cs                # 串口上下文基类（生命周期 + Send）
+│   ├── PortContext.Pipeline.cs       # IO读取 / 解析 / 发送 / 诊断日志循环（partial）
+│   ├── PortContext.Reconnect.cs      # 重连逻辑与失败率告警（partial）
+│   ├── PortContextFactory.cs         # 上下文工厂（设备路由 / 协议推断）
+│   ├── ParserFactory.cs              # 解析器工厂
+│   ├── SerialPortServiceBase.cs      # 对外服务实现（OpenPort / ClosePort / Write / TryWrite）
+│   └── SerialPortReconnectPolicy.cs  # 全局重连策略（进程级静态配置）
+└── docs/
+```
 
 ---
 

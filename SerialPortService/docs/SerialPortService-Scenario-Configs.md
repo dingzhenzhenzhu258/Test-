@@ -118,3 +118,71 @@
 - 先在短压（5-10 分钟）环境验证配置是否满足峰值；再做 24 小时长压观察内存/GC/线程/等待积压等指标。 
 - 若选择 `Wait` 模式，务必监控 `wait_backlog` 并把 `WaitBacklogAlertThreshold` 设置为告警阈值。
 - 高可靠场景强烈建议把后端写入改为“有界队列 + 固定 worker + 批量写入”。
+
+
+---
+
+场景 F：多串口并发（多设备同时接入）
+
+```json
+{
+  "SerialPortService": {
+    "GenericHandlerOptions": {
+      "ResponseChannelCapacity": 2048,
+      "SampleLogInterval": 500,
+      "DropWhenNoActiveRequest": true,
+      "ResponseChannelFullMode": "Wait",
+      "WaitModeQueueCapacity": 4096,
+      "WaitBacklogAlertThreshold": 2048,
+      "ReconnectIntervalMs": 1000,
+      "MaxReconnectAttempts": 3,
+      "TimeoutRateAlertThresholdPercent": 20,
+      "TimeoutRateAlertMinSamples": 20,
+      "ReconnectFailureRateAlertThresholdPercent": 30,
+      "ReconnectFailureRateAlertMinSamples": 20
+    }
+  }
+}
+```
+
+说明：每个串口独立一个 IPortContext，共享同一套 GenericHandlerOptions；WaitBacklogAlertThreshold 按单口积压设定，不是全局汇总。
+
+---
+
+场景 G：自定义协议（非 Modbus）
+
+```csharp
+// 实现自定义解析器
+public class MyDeviceParser : IStreamParser<MyFrame>
+{
+    public bool TryParse(byte b, out MyFrame? result) { ... }
+    public void Reset() { ... }
+}
+// 注册并打开
+var result = service.OpenPort("COM5", 115200, Parity.None, 8, StopBits.One, new MyDeviceParser());
+```
+
+```json
+{
+  "SerialPortService": {
+    "GenericHandlerOptions": {
+      "ResponseChannelCapacity": 1024,
+      "DropWhenNoActiveRequest": false,
+      "ResponseChannelFullMode": "Wait",
+      "ReconnectIntervalMs": 1000,
+      "MaxReconnectAttempts": 3
+    }
+  }
+}
+```
+
+说明：自定义解析器通过泛型 OpenPort<T> 接入，无需修改库核心代码。
+
+---
+
+## 使用建议
+
+- 先在短压（5~10 分钟）验证配置是否满足峰值；再做 24 小时长压观察内存 / GC / 等待积压指标。
+- 若选择 Wait 模式，务必监控 wait_backlog 并设置 WaitBacklogAlertThreshold。
+- 高可靠场景建议后端写入改为有界队列 + 固定 worker + 批量写入。
+- 告警阈值建议从宽松值出发，根据现场噪声逐步收敛。

@@ -2,7 +2,7 @@
 using CommunityToolkit.Mvvm.Input;
 using SerialPortService.Helpers;
 using SerialPortService.Models;
-using SerialPortService.Models.Emuns;
+using SerialPortService.Models.Enums;
 using SerialPortService.Services.Handler;
 using SerialPortService.Services.Interfaces;
 using System.Diagnostics;

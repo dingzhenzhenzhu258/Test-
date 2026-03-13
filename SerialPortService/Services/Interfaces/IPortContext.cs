@@ -41,13 +41,4 @@ namespace SerialPortService.Services.Interfaces
         /// </summary>
         event EventHandler<object>? OnHandleChanged;
     }
-
-    /// <summary>
-    /// 泛型串口上下文接口。
-    /// 为特定协议上下文提供强类型扩展能力预留。
-    /// </summary>
-    /// <typeparam name="T">解析结果类型</typeparam>
-    public interface IPortContext<T> : IPortContext
-    {
-    }
 }

@@ -1,7 +1,7 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SerialPortService.Models;
-using SerialPortService.Models.Emuns;
+using SerialPortService.Models.Enums;
 using SerialPortService.Services.Handler;
 using SerialPortService.Services.Interfaces;
 using System;
@@ -39,8 +39,7 @@ namespace SerialPortService.Services
         private readonly ILoggerFactory _loggerFactory;
         private readonly GenericHandlerOptions _genericHandlerOptions;
         private readonly Microsoft.Extensions.Logging.ILogger _logger;
-        private static readonly ConcurrentDictionary<HandleEnum, ISerialPortService.PortContextFactory> handlerFactories = new();
-        private static Func<HandleEnum, ProtocolEnum>? protocolResolver;
+        private readonly PortContextFactory _contextFactory;
         private static PortBinding? configuredReconnectPolicy;
         private static readonly object reconnectPolicyLock = new();
         private static readonly object portOpenCloseLock = new();
@@ -85,30 +84,7 @@ namespace SerialPortService.Services
                 _genericHandlerOptions.ReconnectFailureRateAlertThresholdPercent,
                 _genericHandlerOptions.ReconnectFailureRateAlertMinSamples);
 
-        }
-
-        private GenericHandlerOptions CreateTaggedOptions(HandleEnum handleEnum, ProtocolEnum protocol)
-        {
-            // 步骤1：复制基础配置并附加标签。
-            // 为什么：运行指标需区分设备类型和协议，便于定位热点问题。
-            // 风险点：若标签缺失，不同设备数据会混淆在同一指标维度中。
-            return new GenericHandlerOptions
-            {
-                ResponseChannelCapacity = _genericHandlerOptions.ResponseChannelCapacity,
-                SampleLogInterval = _genericHandlerOptions.SampleLogInterval,
-                DropWhenNoActiveRequest = _genericHandlerOptions.DropWhenNoActiveRequest,
-                ResponseChannelFullMode = _genericHandlerOptions.ResponseChannelFullMode,
-                WaitModeQueueCapacity = _genericHandlerOptions.WaitModeQueueCapacity,
-                ProtocolTag = protocol.ToString(),
-                DeviceTypeTag = handleEnum.ToString(),
-                ReconnectIntervalMs = _genericHandlerOptions.ReconnectIntervalMs,
-                MaxReconnectAttempts = _genericHandlerOptions.MaxReconnectAttempts,
-                TimeoutRateAlertThresholdPercent = _genericHandlerOptions.TimeoutRateAlertThresholdPercent,
-                TimeoutRateAlertMinSamples = _genericHandlerOptions.TimeoutRateAlertMinSamples,
-                WaitBacklogAlertThreshold = _genericHandlerOptions.WaitBacklogAlertThreshold,
-                ReconnectFailureRateAlertThresholdPercent = _genericHandlerOptions.ReconnectFailureRateAlertThresholdPercent,
-                ReconnectFailureRateAlertMinSamples = _genericHandlerOptions.ReconnectFailureRateAlertMinSamples
-            };
+            _contextFactory = new PortContextFactory(_loggerFactory, _genericHandlerOptions);
         }
 
         /// <summary>
@@ -117,55 +93,7 @@ namespace SerialPortService.Services
         private static readonly ConcurrentDictionary<string, IPortContext> ports = new();
         private static readonly ConcurrentDictionary<string, PortBinding> portBindings = new();
 
-        // 对外只暴露 IReadOnlyDictionary 接口
         public static IReadOnlyDictionary<string, IPortContext> OnlyReadports => ports;
-
-        private (IPortContext Context, ProtocolEnum ResolvedProtocol) CreateContext(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, HandleEnum handleEnum, ProtocolEnum protocol)
-        {
-            var resolvedProtocol = protocol;
-
-            // 步骤1：在协议为 Default 时进行动态推断。
-            // 为什么：业务层可只传设备类型，由服务层统一解析协议。
-            // 风险点：推断规则缺失会导致上下文创建失败或协议不匹配。
-            if (resolvedProtocol == ProtocolEnum.Default)
-            {
-                if (protocolResolver != null)
-                {
-                    resolvedProtocol = protocolResolver(handleEnum);
-                }
-                else
-                {
-                    switch (handleEnum)
-                    {
-                        case HandleEnum.TemperatureSensor:
-                        case HandleEnum.ServoMotor:
-                            resolvedProtocol = ProtocolEnum.ModbusRTU;
-                            break;
-                    }
-                }
-            }
-
-            if (handlerFactories.TryGetValue(handleEnum, out var factory))
-            {
-                // 步骤2：优先走外部工厂创建上下文。
-                // 为什么：允许业务方扩展新设备处理器而不改库内核心代码。
-                // 风险点：工厂实现不当可能引入线程安全或生命周期问题。
-                return (factory(portName, baudRate, parity, dataBits, stopBits, handleEnum, resolvedProtocol, _loggerFactory), resolvedProtocol);
-            }
-
-            IPortContext context = handleEnum switch
-            {
-                HandleEnum.AudibleVisualAlarmHandler => new AudibleVisualAlarmHandler(portName, baudRate, parity, dataBits, stopBits, _loggerFactory.CreateLogger<AudibleVisualAlarmHandler>()),
-                HandleEnum.BarcodeScanner => new BarcodeScannerHandler(portName, baudRate, parity, dataBits, stopBits, _loggerFactory.CreateLogger<BarcodeScannerHandler>()),
-                HandleEnum.TemperatureSensor => new TemperatureSensorHandler(portName, baudRate, parity, dataBits, stopBits, ParserFactory.CreateModbusParser(resolvedProtocol), _loggerFactory.CreateLogger<TemperatureSensorHandler>()),
-                HandleEnum.Default => resolvedProtocol == ProtocolEnum.ModbusRTU || resolvedProtocol == ProtocolEnum.ModbusASCII
-                    ? new ModbusHandler(portName, baudRate, parity, dataBits, stopBits, _loggerFactory.CreateLogger<ModbusHandler>(), CreateTaggedOptions(handleEnum, resolvedProtocol))
-                    : throw new InvalidOperationException("未指定设备类型，且协议不支持自动推断 Handler"),
-                _ => throw new ArgumentOutOfRangeException(nameof(handleEnum))
-            };
-
-            return (context, resolvedProtocol);
-        }
 
         /// <summary>
         /// 打开串口 (使用预定义设备枚举)
@@ -199,7 +127,7 @@ namespace SerialPortService.Services
                     // 风险点：若无原子复用，可能出现多上下文竞争同一串口。
                     var context = ports.GetOrAdd(portName, _ =>
                     {
-                        var result = CreateContext(portName, baudRate, parity, dataBits, stopBits, handleEnum, protocol);
+                        var result = _contextFactory.Create(portName, baudRate, parity, dataBits, stopBits, handleEnum, protocol);
                         resolvedProtocol = result.ResolvedProtocol;
                         return result.Context;
                     });
@@ -256,7 +184,7 @@ namespace SerialPortService.Services
                     // 步骤2：创建或复用 GenericHandler<T>。
                     // 为什么：复用通用并发、重试、告警和指标能力。
                     // 风险点：若复用了错误上下文，会导致解析错位或请求匹配失败。
-                    var context = ports.GetOrAdd(portName, _ => new GenericHandler<T>(portName, baudRate, parity, dataBits, stopBits, parser, _loggerFactory.CreateLogger<GenericHandler<T>>(), CreateTaggedOptions(HandleEnum.Default, ProtocolEnum.Default)));
+                    var context = ports.GetOrAdd(portName, _ => new GenericHandler<T>(portName, baudRate, parity, dataBits, stopBits, parser, _loggerFactory.CreateLogger<GenericHandler<T>>(), _contextFactory.CreateTaggedOptions(HandleEnum.Default, ProtocolEnum.Default)));
                     if (portBindings.TryGetValue(portName, out var currentBinding) && currentBinding != expected)
                     {
                         return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
@@ -487,17 +415,13 @@ namespace SerialPortService.Services
         /// 注册设备处理器工厂。
         /// </summary>
         public bool RegisterHandlerFactory(HandleEnum handleEnum, ISerialPortService.PortContextFactory factory)
-        {
-            return handlerFactories.TryAdd(handleEnum, factory);
-        }
+            => _contextFactory.RegisterHandlerFactory(handleEnum, factory);
 
         /// <summary>
         /// 设置设备协议解析函数。
         /// </summary>
         public void SetProtocolResolver(Func<HandleEnum, ProtocolEnum> resolver)
-        {
-            protocolResolver = resolver;
-        }
+            => _contextFactory.SetProtocolResolver(resolver);
 
         /// <summary>
         /// 检查对应串口是否打开

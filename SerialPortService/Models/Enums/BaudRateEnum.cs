@@ -1,8 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Text;
-
-namespace SerialPortService.Models.Emuns
+﻿namespace SerialPortService.Models.Enums
 {
     /// <summary>
     /// 波特率

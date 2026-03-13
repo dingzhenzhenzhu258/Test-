@@ -1,9 +1,8 @@
-using SerialPortService.Models;
+﻿using SerialPortService.Models;
 using SerialPortService.Services.Interfaces;
 using Logger.Helpers;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.IO.Ports;
 using System.Threading;
@@ -21,8 +20,9 @@ namespace SerialPortService.Services
     /// <item><description>异步发送业务请求（发送任务）</description></item>
     /// </list>
     /// 子类仅需提供解析器，并可通过 <see cref="OnParsed(T)"/> 扩展处理逻辑。
+    /// Pipeline 循环实现见 PortContext.Pipeline.cs，重连逻辑见 PortContext.Reconnect.cs。
     /// </summary>
-    public abstract class PortContext<T> : IPortContext where T : class
+    public abstract partial class PortContext<T> : IPortContext where T : class
     {
         private const bool EnableRawReadChunkLog = true;
         private const int OpenRetryAttempts = 50;
@@ -36,7 +36,7 @@ namespace SerialPortService.Services
         /// <summary>
         /// 内存块包装器，用于在 Channel 中传递借来的数组
         /// </summary>
-        private readonly struct RentedBuffer : IDisposable
+        internal readonly struct RentedBuffer : IDisposable
         {
             public readonly byte[] Buffer;
             public readonly int Length;
@@ -51,7 +51,7 @@ namespace SerialPortService.Services
             {
                 if (Buffer != null)
                 {
-                    ArrayPool<byte>.Shared.Return(Buffer);
+                    System.Buffers.ArrayPool<byte>.Shared.Return(Buffer);
                 }
             }
         }
@@ -59,26 +59,21 @@ namespace SerialPortService.Services
         /// <summary>
         /// 具体串口对象
         /// </summary>
-        private readonly SerialPort _port;
+        private readonly System.IO.Ports.SerialPort _port;
 
         #region 数据缓冲区
         // 发送数据缓冲通道
         private Channel<DataPacket> _sendChannel;
 
-        // 原始数据缓冲通道 (生产者-消费者 模型) 连接 IO 线程和解析任务的传送带，起到削峰填谷和流控的作用
-        // 优化：改为传递 RentedBuffer 避免频繁分配
+        // 原始数据缓冲通道 (生产者-消费者 模型)
         private Channel<RentedBuffer> _rawInputChannel;
         #endregion
 
         #region 任务
-        // 专用的 IO 读取任务，负责从硬件异步读取并写入通道
         private Task? _ioTask;
-
-        // 逻辑解析任务
         private Task? _parseTask;
         private Task? _sendTask;
         private Task? _rawBytesLoggerTask;
-
         #endregion
 
         /// <summary>
@@ -88,24 +83,17 @@ namespace SerialPortService.Services
         private int _closeSignaled;
         private int _disposeSignaled;
 
-        // 诊断：用于按分钟统计原始字节接收量
+        // 诊断：按分钟统计原始字节
         private long _rawBytesSinceLastLog;
         private long _rawReadChunkSeq;
         private long _rawReadByteTotal;
         private volatile bool _lastCloseSucceeded = true;
 
-        /// <summary>
-        /// 运行状态
-        /// </summary>
         private volatile bool _isRunning = false;
         private long _reconnectCycleCount;
         private long _reconnectExhaustedCount;
 
-        /// <summary>
-        /// 串口名
-        /// </summary>
         public string Name => _port.PortName;
-
         public bool LastCloseSucceeded => _lastCloseSucceeded;
 
         /// <summary>
@@ -113,41 +101,20 @@ namespace SerialPortService.Services
         /// </summary>
         protected byte[]? _lastSent;
 
-        /// <summary>
-        /// 处理器事件
-        /// </summary>
         public event EventHandler<object>? OnHandleChanged;
 
-        /// <summary>
-        /// 解析成功后的内部回调（供子类进行高性能处理，避免依赖事件回调）
-        /// </summary>
-        /// <param name="result">解析结果</param>
         protected virtual void OnParsed(T result) { }
 
-        /// <summary>
-        /// 解析器
-        /// </summary>
         protected abstract IStreamParser<T> Parser { get; }
 
-        /// <summary>
-        /// 构造函数
-        /// </summary>
-        /// <param name="portName"></param>
-        /// <param name="baudRate"></param>
-        /// <param name="parity"></param>
-        /// <param name="dataBits"></param>
-        /// <param name="stopBits"></param>
-        /// <param name="logger"></param>
         public PortContext(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
         {
             Logger = logger;
-            // 初始化串口
-            _port = new SerialPort(portName, baudRate, parity, dataBits, stopBits)
+            _port = new System.IO.Ports.SerialPort(portName, baudRate, parity, dataBits, stopBits)
             {
                 ReadBufferSize = 1024 * 1024,
-                ReadTimeout = SerialPort.InfiniteTimeout,
+                ReadTimeout = System.IO.Ports.SerialPort.InfiniteTimeout,
             };
-
             _sendChannel = CreateSendChannel();
             _rawInputChannel = CreateRawInputChannel();
         }
@@ -159,20 +126,129 @@ namespace SerialPortService.Services
 
         private static Channel<RentedBuffer> CreateRawInputChannel()
         {
-            // 配置背压通道：容量为 500 个数据块 
             return Channel.CreateBounded<RentedBuffer>(new BoundedChannelOptions(500)
             {
-                // 数据满时的行为：等待
                 FullMode = BoundedChannelFullMode.Wait,
-                // 单一读写者，优化性能
                 SingleReader = true,
-                // 单一写者，优化性能
                 SingleWriter = true
             });
         }
 
+        private void EnsurePortOpenedWithRetry()
+        {
+            if (_port.IsOpen)
+            {
+                return;
+            }
+
+            Exception? lastException = null;
+            for (var attempt = 1; attempt <= OpenRetryAttempts; attempt++)
+            {
+                try
+                {
+                    _port.Open();
+                    lastException = null;
+                    break;
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    lastException = ex;
+                    if (attempt < OpenRetryAttempts)
+                    {
+                        Thread.Sleep(OpenRetryDelayMs);
+                    }
+                }
+            }
+
+            if (lastException != null)
+            {
+                throw new InvalidOperationException($"串口 {Name} 打开失败：设备仍被占用，请确认已完全关闭后重试", lastException);
+            }
+        }
+
+        private void StartPipelineTasks(CancellationToken token)
+        {
+            _ioTask = Task.Run(() => IoReadLoopAsync(token));
+            _parseTask = Task.Run(() => ParseLoop(token));
+            _sendTask = Task.Run(() => SendLoop(token));
+            _rawBytesLoggerTask = Task.Run(() => RawBytesLoggerLoop(token));
+        }
+
+        private void StopAndCompleteChannels()
+        {
+            _isRunning = false;
+            _cts?.Cancel();
+            _sendChannel.Writer.TryComplete();
+            _rawInputChannel.Writer.TryComplete();
+        }
+
+        private void TryCloseSerialPort()
+        {
+            if (!_port.IsOpen)
+            {
+                return;
+            }
+
+            var closeTask = Task.Run(() =>
+            {
+                try { _port.DiscardInBuffer(); } catch { }
+                try { _port.Close(); } catch { }
+            });
+
+            if (closeTask.Wait(1000))
+            {
+                return;
+            }
+
+            _lastCloseSucceeded = false;
+            Logger.AddLog(LogLevel.Warning, $"[{Name}] Serial close timeout, continue shutdown");
+
+            var forceDisposeTask = Task.Run(() =>
+            {
+                try { _port.Dispose(); } catch { }
+            });
+
+            if (!forceDisposeTask.Wait(3000))
+            {
+                _lastCloseSucceeded = false;
+                Logger.AddLog(LogLevel.Warning, $"[{Name}] Serial force-dispose timeout, port handle may still be occupied");
+            }
+        }
+
+        private void WaitPipelineTasksForStop()
+        {
+            if (_ioTask == null && _parseTask == null && _sendTask == null && _rawBytesLoggerTask == null)
+            {
+                return;
+            }
+
+            var tasks = new List<Task>();
+            if (_ioTask != null) tasks.Add(_ioTask);
+            if (_parseTask != null) tasks.Add(_parseTask);
+            if (_sendTask != null) tasks.Add(_sendTask);
+            if (_rawBytesLoggerTask != null) tasks.Add(_rawBytesLoggerTask);
+
+            try
+            {
+                var completed = Task.WaitAll(tasks.ToArray(), 2000);
+                if (!completed)
+                {
+                    _lastCloseSucceeded = false;
+                    Logger.AddLog(LogLevel.Warning, $"[{Name}] Pipeline stop timeout, forcing serial port close");
+                }
+            }
+            catch (AggregateException ex)
+            {
+                _lastCloseSucceeded = false;
+                Logger.AddLog(LogLevel.Warning, $"[{Name}] Pipeline stop raised exception: {ex.Flatten().Message}", exception: ex);
+            }
+            catch
+            {
+            }
+        }
+
         /// <summary>
-        /// 打开串口 并启动处理引擎
+        /// 打开串口并启动处理引擎
         /// </summary>
         public void Open()
         {
@@ -181,56 +257,17 @@ namespace SerialPortService.Services
             // 风险点：多任务并发读写同一串口会触发不可预期错误。
             if (_isRunning) return;
             Interlocked.Exchange(ref _closeSignaled, 0);
-            if (!_port.IsOpen)
-            {
-                // 步骤1.1：打开串口时做短暂重试。
-                // 为什么：上一次关闭后驱动释放句柄可能存在短暂延迟，立即重开会报 Access denied。
-                // 风险点：无重试会把可恢复的瞬时占用误判为永久失败。
-                Exception? lastException = null;
-
-                for (var attempt = 1; attempt <= OpenRetryAttempts; attempt++)
-                {
-                    try
-                    {
-                        _port.Open();
-                        lastException = null;
-                        break;
-                    }
-                    catch (UnauthorizedAccessException ex)
-                    {
-                        lastException = ex;
-                        if (attempt < OpenRetryAttempts)
-                        {
-                            Thread.Sleep(OpenRetryDelayMs);
-                        }
-                    }
-                }
-
-                if (lastException != null)
-                {
-                    throw new InvalidOperationException($"串口 {Name} 打开失败：设备仍被占用，请确认已完全关闭后重试", lastException);
-                }
-            }
+            EnsurePortOpenedWithRetry();
 
             _isRunning = true;
             _cts = new CancellationTokenSource();
             _sendChannel = CreateSendChannel();
             _rawInputChannel = CreateRawInputChannel();
 
-            // 1. 启动 IO 读取任务 (异步读取 BaseStream，避免轮询与 Thread.Sleep)
-            // 步骤2：按“读-解析-发送”顺序启动后台任务。
+            // 步骤2：按"读-解析-发送"顺序启动后台任务。
             // 为什么：拆分职责便于背压控制与性能观测。
             // 风险点：任一任务未启动会造成数据链路断裂。
-            _ioTask = Task.Run(() => IoReadLoopAsync(_cts.Token));
-
-            // 2. 启动 解析任务 (消费原始数据 -> 状态机)
-            _parseTask = Task.Run(() => ParseLoop(_cts.Token));
-
-            // 3. 启动 发送任务 (保持你原有的逻辑)
-            _sendTask = Task.Run(() => SendLoop(_cts.Token));
-
-            // 启动原始字节统计日志任务（每分钟打印一次）
-            _rawBytesLoggerTask = Task.Run(() => RawBytesLoggerLoop(_cts.Token));
+            StartPipelineTasks(_cts.Token);
 
             Logger.AddLog(LogLevel.Information, $"[{Name}] Pipeline 引擎已启动");
         }
@@ -250,247 +287,22 @@ namespace SerialPortService.Services
             // 步骤1：先标记停止并关闭通道写端。
             // 为什么：通知后台任务尽快退出循环。
             // 风险点：若不先停写，关闭期间可能继续有新消息进入。
-            _isRunning = false;
-            _cts?.Cancel();
-            _sendChannel.Writer.TryComplete();
-            _rawInputChannel.Writer.TryComplete();
+            StopAndCompleteChannels();
 
             // 步骤2：优先关闭底层串口句柄以打断阻塞读写。
             // 为什么：部分驱动下 ReadAsync 取消不敏感，需关闭句柄触发退出。
             // 风险点：若先等待任务再关句柄，UI 线程可能长时间阻塞。
-            if (_port.IsOpen)
-            {
-                var closeTask = Task.Run(() =>
-                {
-                    try
-                    {
-                        _port.DiscardInBuffer();
-                    }
-                    catch
-                    {
-                    }
-
-                    try
-                    {
-                        _port.Close();
-                    }
-                    catch
-                    {
-                    }
-                });
-
-                if (!closeTask.Wait(1000))
-                {
-                    _lastCloseSucceeded = false;
-                    Logger.AddLog(LogLevel.Warning, $"[{Name}] Serial close timeout, continue shutdown");
-
-                    // 步骤2.1：关闭超时时执行应急释放。
-                    // 为什么：当驱动处于异常状态时，仅 Close 可能无法及时释放句柄。
-                    // 风险点：句柄未释放会导致后续重新打开出现 UnauthorizedAccessException。
-                    var forceDisposeTask = Task.Run(() =>
-                    {
-                        try
-                        {
-                            _port.Dispose();
-                        }
-                        catch
-                        {
-                        }
-                    });
-
-                    if (!forceDisposeTask.Wait(3000))
-                    {
-                        _lastCloseSucceeded = false;
-                        Logger.AddLog(LogLevel.Warning, $"[{Name}] Serial force-dispose timeout, port handle may still be occupied");
-                    }
-                }
-            }
+            TryCloseSerialPort();
 
             // 步骤3：等待后台任务有序结束。
             // 为什么：尽量避免在任务运行中直接关闭串口句柄。
             // 风险点：强行关闭会导致对象释放异常和数据中断。
-            if (_ioTask != null || _parseTask != null || _sendTask != null)
-            {
-                var tasks = new List<Task>();
-                if (_ioTask != null) tasks.Add(_ioTask);
-                if (_parseTask != null) tasks.Add(_parseTask);
-                if (_sendTask != null) tasks.Add(_sendTask);
-                if (_rawBytesLoggerTask != null) tasks.Add(_rawBytesLoggerTask);
-                try
-                {
-                    var completed = Task.WaitAll(tasks.ToArray(), 2000);
-                    if (!completed)
-                    {
-                        _lastCloseSucceeded = false;
-                        Logger.AddLog(LogLevel.Warning, $"[{Name}] Pipeline stop timeout, forcing serial port close");
-                    }
-                }
-                catch (AggregateException ex)
-                {
-                    _lastCloseSucceeded = false;
-                    Logger.AddLog(LogLevel.Warning, $"[{Name}] Pipeline stop raised exception: {ex.Flatten().Message}", exception: ex);
-                }
-                catch
-                {
-                }
-            }
+            WaitPipelineTasksForStop();
         }
 
         /// <summary>
-        /// Stage 1: IO 异步读取任务 (Producer)
+        /// 业务层入口：入队异步发送，不阻塞业务线程。
         /// </summary>
-        private async Task IoReadLoopAsync(CancellationToken token)
-        {
-            const int readSize = 4096;
-
-            // 只要没停止就持续读取
-            while (_isRunning && !token.IsCancellationRequested)
-            {
-                byte[]? buffer = null;
-                try
-                {
-                    if (!_port.IsOpen)
-                    {
-                        if (!await TryReconnectAsync(token, "port closed").ConfigureAwait(false))
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    buffer = ArrayPool<byte>.Shared.Rent(readSize);
-                    int count = await _port.BaseStream.ReadAsync(buffer.AsMemory(0, readSize), token).ConfigureAwait(false);
-
-                    if (count > 0)
-                    {
-                        // 诊断：统计原始字节计数
-                        Interlocked.Add(ref _rawBytesSinceLastLog, count);
-                        var seq = Interlocked.Increment(ref _rawReadChunkSeq);
-                        var totalBytes = Interlocked.Add(ref _rawReadByteTotal, count);
-
-                        // 步骤1：按批次记录接收缓冲区原始字节。
-                        // 为什么：用于定位“是否收到字节但未解析成包”的问题。
-                        // 风险点：高频十六进制日志会增加 IO 与 CPU 开销。
-                        if (EnableRawReadChunkLog)
-                        {
-                            Logger.AddLog(
-                                LogLevel.Information,
-                                "[IO Read Chunk] Port={Port}, Seq={Seq}, Count={Count}, TotalBytes={TotalBytes}, Hex={Hex}",
-                                args: new object[] { Name, seq, count, totalBytes, BitConverter.ToString(buffer, 0, count) });
-                        }
-
-                        var rented = new RentedBuffer(buffer, count);
-                        buffer = null;
-
-                        // 写入通道，如果满了会异步等待 (自动流控)
-                        if (!_rawInputChannel.Writer.TryWrite(rented))
-                        {
-                            try
-                            {
-                                await _rawInputChannel.Writer.WriteAsync(rented, token).ConfigureAwait(false);
-                            }
-                            catch (ChannelClosedException)
-                            {
-                                rented.Dispose();
-                                break;
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                rented.Dispose();
-                                break;
-                            }
-                            catch
-                            {
-                                rented.Dispose();
-                                throw;
-                            }
-                        }
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (ObjectDisposedException) when (token.IsCancellationRequested)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    if (_isRunning && !token.IsCancellationRequested)
-                    {
-                        Logger.AddLog(LogLevel.Error, $"[IO Error] {ex.Message}", exception: ex);
-                        if (!await TryReconnectAsync(token, "read failed").ConfigureAwait(false))
-                        {
-                            break;
-                        }
-                    }
-                }
-                finally
-                {
-                    if (buffer != null)
-                    {
-                        ArrayPool<byte>.Shared.Return(buffer);
-                    }
-                }
-            }
-        }
-
-        /// <summary>
-        /// 专门负责从通道拿数据，运行状态机解析出完整的业务对象
-        /// </summary>
-        /// <param name="token"></param>
-        /// <returns></returns>
-        // --- Stage 2: 解析任务 (Consumer) ---
-        private async Task ParseLoop(CancellationToken token)
-        {
-            try
-            {
-                // 复用列表，减少分配
-                var resultList = new List<T>();
-
-                await foreach (var chunk in _rawInputChannel.Reader.ReadAllAsync(token))
-                {
-                    try
-                    {
-                        // 这里可以体现"逐字节"的思想：
-                        // 虽然我们拿到了一个 chunk (Span)，但我们将其视为一个字节流
-                        // 真正的"逐字节状态机"逻辑在 Parser.Parse 内部实现
-                        
-                        // 批量喂给解析器 (使用 Span 切片)
-                        Parser.Parse(chunk.Buffer.AsSpan(0, chunk.Length), resultList);
-
-                        if (resultList.Count > 0)
-                        {
-                            foreach (var result in resultList)
-                            {
-                                OnParsed(result);
-                                var handler = OnHandleChanged;
-                                if (handler != null)
-                                {
-                                    // 仅在存在订阅者时才创建事件对象并触发
-                                    var operateResult = new OperateResult<T>(result, true, "Success");
-                                    handler(this, operateResult);
-                                }
-                            }
-                            resultList.Clear();
-                        }
-                    }
-                    finally
-                    {
-                        // 消费完毕，必须归还数组到池中！
-                        chunk.Dispose();
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-        }
-
-        /// <summary>
-        /// 业务层调用 Send() 时只是把数据扔进这个队列瞬间返回，不会因为串口写入慢而阻塞业务线程
-        /// </summary>
-        /// <param name="data"></param>
-        /// <returns></returns>
         public async Task<byte[]> Send(byte[] data)
         {
             // 步骤1：发送前进行数据与状态校验。
@@ -515,168 +327,6 @@ namespace SerialPortService.Services
         }
 
         /// <summary>
-        /// 写入串口发送循环
-        /// </summary>
-        /// <param name="token"></param>
-        /// <returns></returns>
-        private async Task SendLoop(CancellationToken token)
-        {
-            try
-            {
-                await foreach (var msg in _sendChannel.Reader.ReadAllAsync(token))
-                {
-                    // 打印发送的原始数据 (Hex)
-                    // Logger.LogTrace("[IO Write] {Data}", BitConverter.ToString(msg.Data));
-
-                    if (!_port.IsOpen && !await TryReconnectAsync(token, "write path detected closed port").ConfigureAwait(false))
-                    {
-                        Logger.AddLog(LogLevel.Error, $"[IO Write] Send dropped due to reconnect failure. Port={Name}, Bytes={msg.Data.Length}");
-                        continue;
-                    }
-
-                    try
-                    {
-                        await _port.BaseStream.WriteAsync(msg.Data.AsMemory(0, msg.Data.Length), token).ConfigureAwait(false);
-                        _lastSent = msg.Data;
-                    }
-                    catch (Exception ex) when (!token.IsCancellationRequested)
-                    {
-                        Logger.AddLog(LogLevel.Error, $"[IO Write] {ex.Message}", exception: ex);
-                        await TryReconnectAsync(token, "write failed").ConfigureAwait(false);
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex) when (!token.IsCancellationRequested)
-            {
-                Logger.AddLog(LogLevel.Error, $"[IO Write] {ex.Message}", exception: ex);
-            }
-        }
-
-        /// <summary>
-        /// 原始字节统计日志任务（每分钟打印一次）
-        /// </summary>
-        private async Task RawBytesLoggerLoop(CancellationToken token)
-        {
-            try
-            {
-                while (!token.IsCancellationRequested)
-                {
-                    await Task.Delay(TimeSpan.FromMinutes(1), token).ConfigureAwait(false);
-                    
-                    var bytesCount = Interlocked.Exchange(ref _rawBytesSinceLastLog, 0);
-                    if (bytesCount > 0)
-                    {
-                        Logger.AddLog(LogLevel.Information, $"[{Name}] Raw bytes received in last minute: {bytesCount:N0} bytes");
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected when token is cancelled
-            }
-            catch (Exception ex)
-            {
-                Logger.AddLog(LogLevel.Error, $"[{Name}] RawBytesLoggerLoop failed: {ex.Message}", exception: ex);
-            }
-        }
-
-        protected async Task<bool> TryReconnectAsync(CancellationToken token, string reason, bool forceReopen = false)
-        {
-            var maxAttempts = SerialPortReconnectPolicy.MaxReconnectAttempts;
-            var intervalMs = SerialPortReconnectPolicy.ReconnectIntervalMs;
-
-            // 步骤1：按最大次数执行重连尝试。
-            // 为什么：给短暂链路故障留恢复窗口。
-            // 风险点：无限重试会造成线程长期占用。
-            for (int attempt = 1; attempt <= maxAttempts && !token.IsCancellationRequested; attempt++)
-            {
-                try
-                {
-                    if (!_isRunning) return false;
-
-                    if (_port.IsOpen && !forceReopen)
-                    {
-                        return true;
-                    }
-
-                    if (_port.IsOpen && forceReopen)
-                    {
-                        try
-                        {
-                            _port.Close();
-                        }
-                        catch
-                        {
-                        }
-                    }
-
-                    // 步骤2：重连成功后立即记录结果并返回。
-                    // 为什么：尽快恢复读写链路，减少业务中断。
-                    // 风险点：成功后不及时返回会产生多余重连动作。
-                    _port.Open();
-                    Logger.AddLog(LogLevel.Warning, $"[{Name}] Reconnected successfully. Reason={reason}, Attempt={attempt}/{maxAttempts}");
-                    ObserveReconnectOutcome(isExhausted: false);
-                    return true;
-                }
-                catch (Exception ex) when (!token.IsCancellationRequested)
-                {
-                    Logger.AddLog(LogLevel.Warning, $"[{Name}] Reconnect failed. Reason={reason}, Attempt={attempt}/{maxAttempts}, Error={ex.Message}");
-                }
-
-                // 步骤3：失败后按间隔退避。
-                // 为什么：避免连续重试造成设备或总线压力。
-                // 风险点：无退避会触发重连风暴。
-                if (attempt < maxAttempts)
-                {
-                    try
-                    {
-                        await Task.Delay(intervalMs, token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            // 步骤4：重连耗尽后记录失败告警。
-            // 为什么：给上层提供可观测故障信号。
-            // 风险点：无耗尽告警会导致故障长期隐蔽。
-            Logger.AddLog(LogLevel.Error, $"[{Name}] Reconnect exhausted. Reason={reason}, MaxAttempts={maxAttempts}");
-            ObserveReconnectOutcome(isExhausted: true);
-            return false;
-        }
-
-        private void ObserveReconnectOutcome(bool isExhausted)
-        {
-            var total = Interlocked.Increment(ref _reconnectCycleCount);
-            if (isExhausted)
-            {
-                Interlocked.Increment(ref _reconnectExhaustedCount);
-            }
-
-            var thresholdPercent = SerialPortReconnectPolicy.ReconnectFailureRateAlertThresholdPercent;
-            var minSamples = SerialPortReconnectPolicy.ReconnectFailureRateAlertMinSamples;
-            if (thresholdPercent <= 0 || minSamples <= 0)
-            {
-                return;
-            }
-
-            if (total < minSamples || total % minSamples != 0)
-            {
-                return;
-            }
-
-            var exhausted = Interlocked.Read(ref _reconnectExhaustedCount);
-            var failureRatePercent = (double)exhausted * 100d / total;
-            if (failureRatePercent >= thresholdPercent)
-            {
-                Logger.AddLog(LogLevel.Error, $"[{Name}] Reconnect failure-rate alert: {failureRatePercent:F2}% (exhausted={exhausted}, total={total}, threshold={thresholdPercent}%)");
-            }
-        }
-
-        /// <summary>
         /// 释放资源
         /// </summary>
         public virtual void Dispose()
@@ -690,16 +340,10 @@ namespace SerialPortService.Services
 
             // 步骤1：限时释放串口对象。
             // 为什么：部分驱动在异常态下 Dispose 可能长时间阻塞。
-            // 风险点：若在 UI 线程无保护调用，可能表现为“关闭串口卡死”。
+            // 风险点：若在 UI 线程无保护调用，可能表现为"关闭串口卡死"。
             var disposeTask = Task.Run(() =>
             {
-                try
-                {
-                    _port?.Dispose();
-                }
-                catch
-                {
-                }
+                try { _port?.Dispose(); } catch { }
             });
 
             if (!disposeTask.Wait(1000))

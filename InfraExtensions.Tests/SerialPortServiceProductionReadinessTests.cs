@@ -2,7 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using SerialPortService.Models;
-using SerialPortService.Models.Emuns;
+using SerialPortService.Models.Enums;
 using SerialPortService.Extensions;
 using SerialPortService.Services;
 using SerialPortService.Services.Handler;
