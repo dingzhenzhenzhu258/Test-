@@ -90,8 +90,9 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                     await _persistQueue.Writer.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException ex)
             {
+                _logger.AddLog(LogLevel.Information, "接收循环已取消", exception: ex);
             }
         }
 
@@ -122,11 +123,13 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                         }
                     }
                 }
-                catch (TimeoutException)
+                catch (TimeoutException ex)
                 {
+                    _logger.AddLog(LogLevel.Debug, "持久化批处理等待超时，继续下一轮", exception: ex);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException ex)
                 {
+                    _logger.AddLog(LogLevel.Information, "持久化工作循环已取消", exception: ex);
                     break;
                 }
 
@@ -174,8 +177,9 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                         _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG mem={memoryMb:F1}MB, threads={threadCount}, gc={gc0}/{gc1}/{gc2}");
                     }
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException ex)
                 {
+                    _logger.AddLog(LogLevel.Information, "诊断循环已取消", exception: ex);
                     break;
                 }
                 catch (Exception ex)
@@ -270,47 +274,60 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         [RelayCommand(CanExecute = nameof(CanOpenPort))]
         private async Task OpenPortAsync()
         {
-            if (string.IsNullOrWhiteSpace(SelectedPort))
+            try
             {
-                StatusMessage = "请先选择串口";
-                return;
-            }
+                if (string.IsNullOrWhiteSpace(SelectedPort))
+                {
+                    StatusMessage = "请先选择串口";
+                    return;
+                }
 
-            if (PollIntervalMs < 0)
+                if (string.Equals(SelectedPort, "TEST-OPEN-EX", StringComparison.OrdinalIgnoreCase) || BaudRate == 999001)
+                {
+                    throw new InvalidOperationException("打开串口异常测试：用于验证异常日志与指标上报链路");
+                }
+
+                if (PollIntervalMs < 0)
+                {
+                    PollIntervalMs = 0;
+                }
+
+                if (PollIntervalMs < MinPollIntervalMs)
+                {
+                    PollIntervalMs = MinPollIntervalMs;
+                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] WARN: 轮询间隔过小，已自动调整为 {MinPollIntervalMs}ms");
+                }
+
+                if (!ValidateCommandParameters(out var validationMessage))
+                {
+                    StatusMessage = validationMessage;
+                    return;
+                }
+
+                var result = _serialPortService.OpenPort(SelectedPort, BaudRate, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
+                StatusMessage = result.Message ?? string.Empty;
+
+                if (!result.IsSuccess)
+                {
+                    return;
+                }
+
+                if (_serialPortService.TryGetContext(SelectedPort, out var ctx) && ctx is IModbusContext modbus)
+                {
+                    _modbusContext = modbus;
+                    IsPortOpened = true;
+                    UpdateStatusMessage();
+                    return;
+                }
+
+                await _serialPortService.ClosePortAsync(SelectedPort);
+                StatusMessage = "串口上下文不是 Modbus 上下文";
+            }
+            catch (Exception ex)
             {
-                PollIntervalMs = 0;
+                _logger.AddLog(LogLevel.Error, "打开串口失败，Port={Port}", exception: ex, args: SelectedPort ?? "<null>");
+                StatusMessage = $"打开串口失败: {ex.Message}";
             }
-
-            if (PollIntervalMs < MinPollIntervalMs)
-            {
-                PollIntervalMs = MinPollIntervalMs;
-                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] WARN: 轮询间隔过小，已自动调整为 {MinPollIntervalMs}ms");
-            }
-
-            if (!ValidateCommandParameters(out var validationMessage))
-            {
-                StatusMessage = validationMessage;
-                return;
-            }
-
-            var result = _serialPortService.OpenPort(SelectedPort, BaudRate, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
-            StatusMessage = result.Message ?? string.Empty;
-
-            if (!result.IsSuccess)
-            {
-                return;
-            }
-
-            if (_serialPortService.TryGetContext(SelectedPort, out var ctx) && ctx is IModbusContext modbus)
-            {
-                _modbusContext = modbus;
-                IsPortOpened = true;
-                UpdateStatusMessage();
-                return;
-            }
-
-            await _serialPortService.ClosePortAsync(SelectedPort);
-            StatusMessage = "串口上下文不是 Modbus 上下文";
         }
 
         /// <summary>
@@ -531,6 +548,7 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 catch (Exception ex)
                 {
                     _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
+                    _logger.AddLog(LogLevel.Error, "发送循环接收响应失败，Command={Command}", exception: ex, args: txHex);
                 }
 
                 // 步骤4：按配置补齐剩余周期，支持任意 ms（含 0ms）。

@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using LoggerExtensionsHost = Logger.Extensions.LoggerExtensions;
 using Serilog.Context;
 using System;
 using System.Collections.Generic;
@@ -21,6 +22,36 @@ namespace Logger.Helpers
         /// 当 <c>isShowUI=true</c> 时触发，便于界面层实时显示日志文本。
         /// </summary>
         public static event Action<LogLevel, string>? OnUILog;
+
+        public static void AddLog(
+         this ILogger logger,
+         LogLevel level,
+         string messageTemplate,
+         Exception exception,
+         object? args,
+         [CallerMemberName] string memberName = "",
+         [CallerFilePath] string sourceFilePath = "",
+         [CallerLineNumber] int sourceLineNumber = 0)
+        {
+            var normalizedArgs = args switch
+            {
+                null => Array.Empty<object>(),
+                object[] arrayArgs => arrayArgs,
+                _ => new[] { args }
+            };
+
+            AddLog(
+                logger,
+                level,
+                messageTemplate,
+                isShowUI: false,
+                uiMessage: null,
+                exception: exception,
+                memberName: memberName,
+                sourceFilePath: sourceFilePath,
+                sourceLineNumber: sourceLineNumber,
+                args: normalizedArgs);
+        }
 
         /// <summary>
         /// 统一写日志入口。
@@ -49,9 +80,12 @@ namespace Logger.Helpers
          [CallerLineNumber] int sourceLineNumber = 0,
          params object[] args)
         {
+            var safeArgs = args ?? Array.Empty<object>();
+            (exception, safeArgs) = NormalizeException(exception, safeArgs);
+
             if (isShowUI)
             {
-                var uiText = uiMessage ?? (args != null && args.Length > 0 ? string.Format(messageTemplate, args) : messageTemplate);
+                var uiText = uiMessage ?? BuildReplayMessage(messageTemplate, safeArgs);
                 OnUILog?.Invoke(level, uiText);
             }
 
@@ -64,9 +98,75 @@ namespace Logger.Helpers
             using (LogContext.PushProperty("FilePath", sourceFilePath))
             using (LogContext.PushProperty("LineNumber", sourceLineNumber))
             {
-                // 步骤1：确保 args 不为 null 以避免 CS8604 警告，风险点：显式传递 null 会导致异常
-                logger.Log(level, exception, messageTemplate, args ?? Array.Empty<object>());
+                using var exceptionCapturedScope = LogContext.PushProperty("ExceptionCaptured", exception != null);
+                using var exceptionTypeScope = exception != null
+                    ? LogContext.PushProperty("ExceptionType", exception.GetType().FullName ?? exception.GetType().Name)
+                    : null;
+
+                logger.Log(level, exception, messageTemplate, safeArgs);
+
+                // 步骤2：当 OTLP 不可用时将业务日志入本地补传队列。
+                // 为什么：保障离线窗口内日志不因远端不可达而永久丢失。
+                // 风险点：若消息格式化失败会影响补传可读性。
+                var replayMessage = BuildReplayMessage(messageTemplate, safeArgs);
+                LoggerExtensionsHost.EnqueueReplayLogIfNeeded(level, replayMessage, exception);
             }
+        }
+
+        /// <summary>
+        /// 构建用于补传队列的日志文本。
+        /// </summary>
+        private static string BuildReplayMessage(string messageTemplate, object[] args)
+        {
+            if (args.Length == 0)
+            {
+                return messageTemplate;
+            }
+
+            if (LooksLikeCompositeFormat(messageTemplate))
+            {
+                try
+                {
+                    return string.Format(messageTemplate, args);
+                }
+                catch
+                {
+                }
+            }
+
+            return $"{messageTemplate} | Args: {string.Join(", ", args.Select(a => a?.ToString() ?? "<null>"))}";
+        }
+
+        private static bool LooksLikeCompositeFormat(string messageTemplate)
+        {
+            for (var i = 0; i < messageTemplate.Length - 1; i++)
+            {
+                if (messageTemplate[i] == '{' && char.IsDigit(messageTemplate[i + 1]))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static (Exception? exception, object[] args) NormalizeException(Exception? exception, object[] args)
+        {
+            if (exception != null || args.Length == 0)
+            {
+                return (exception, args);
+            }
+
+            for (var i = args.Length - 1; i >= 0; i--)
+            {
+                if (args[i] is Exception extracted)
+                {
+                    var newArgs = args.Where((_, index) => index != i).ToArray();
+                    return (extracted, newArgs);
+                }
+            }
+
+            return (exception, args);
         }
     }
 }

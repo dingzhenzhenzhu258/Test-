@@ -71,6 +71,8 @@ app.SubscribeGlobalExceptions(logger);
 
 - `Logs`：可在端点恢复后自动热恢复（无需重启，受配置控制）。
 - `Tracing/Metrics`：可保持导出器启用，端点恢复后自动继续上报（受配置控制）。
+- `Tracing/Metrics`：也可启用“运行时热重建模式”，在启动时未挂载导出器的情况下，端点恢复后动态重建并恢复上报（受配置控制）。
+- `Logs`：支持本地落盘补传队列（JSONL），离线期间写入 `logs/otlp-replay.queue.jsonl`，恢复后按批重放。
 
 ### 3.3 关键保障
 
@@ -91,6 +93,13 @@ app.SubscribeGlobalExceptions(logger);
 - `AutoRecoverProbeIntervalMs`：恢复探测周期（毫秒）
 - `AutoRecoverApplyForLogs`：端点恢复后是否自动热恢复日志导出
 - `AutoRecoverApplyForTelemetry`：是否让追踪/指标保持自动恢复策略
+- `AutoRecoverApplyForTelemetryRuntimeSwitch`：是否启用 Tracing/Metrics 运行时热重建（默认 `false`）
+- `ReplayQueueEnabled`：是否启用离线日志补传队列
+- `ReplayBatchSize`：每次恢复时最大重放条数
+- `ReplayQueueMaxFileSizeMb`：单个补传分段文件上限（MB）
+- `ReplayQueueMaxTotalSizeMb`：补传目录总大小上限（MB）
+- `ReplayQueueMaxAgeHours`：补传文件最大保留时长（小时）
+- `ReplayQueueOverflowStrategy`：容量超限策略（`DropOldest` / `RejectNew` / `WarnOnly`）
 - `LogsEndpoint` / `TracesEndpoint` / `MetricsEndpoint`：三类导出端点
 
 `Serilog`：
