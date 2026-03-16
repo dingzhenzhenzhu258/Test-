@@ -23,7 +23,7 @@ namespace SerialPortService.Services.Parser
         }
 
         // 默认 Parse 方法会调用 TryParse，这里不需要重写 Parse
-        
+
         public bool TryParse(byte b, [NotNullWhen(true)] out string? result)
         {
             // 步骤1：默认结果置空。
@@ -76,24 +76,18 @@ namespace SerialPortService.Services.Parser
                     {
                         bool equal = lastSent.SequenceEqual(receivedData);
 
-                        // 打印日志 (保留你原有的风格)
                         if (equal)
                         {
-                            Console.WriteLine($"接收报文与发送报文一致 ✅");
                             result = "报文发送接收成功";
                         }
                         else
                         {
-                            Console.WriteLine($"接收报文与发送报文不一致 ❌");
-                            Console.WriteLine($"发送: {BitConverter.ToString(lastSent)}");
-                            Console.WriteLine($"接收: {BitConverter.ToString(receivedData)}");
                             result = "报文发送接收失败";
                         }
-                        return true; // 成功产出 result
+                        return true;
                     }
                     else
                     {
-                        Console.WriteLine($"没有可对比的发送报文");
                         result = "报文发送接收失败: _lastSent为null";
                         return true;
                     }

@@ -25,8 +25,9 @@ namespace SerialPortService.Services
     /// 该类面向业务层提供统一 API（Open/Close/Write/TryGetContext），
     /// 并通过 <see cref="GenericHandlerOptions"/> 统一下发并发/限流/重连策略。
     /// </remarks>
-    public class SerialPortServiceBase : ISerialPortService
+    public class SerialPortServiceBase : ISerialPortService, IDisposable
     {
+        private int _disposed;
         private readonly record struct PortBinding(
             int BaudRate,
             Parity Parity,
@@ -321,7 +322,9 @@ namespace SerialPortService.Services
                 });
 
                 // 3秒硬超时：专门对付那条“第67万条报文”引发的驱动层死锁
-                if (await Task.WhenAny(closeTask, Task.Delay(3000)) != closeTask)
+                using var timeoutCts = new CancellationTokenSource();
+                var delayTask = Task.Delay(3000, timeoutCts.Token);
+                if (await Task.WhenAny(closeTask, delayTask).ConfigureAwait(false) != closeTask)
                 {
                     // 使用你的 LoggerHelper 扩展方法
                     _logger.AddLog(
@@ -333,6 +336,8 @@ namespace SerialPortService.Services
                     // 注意：绝不执行 TryAdd 回滚，坏掉的串口必须从系统中彻底剔除
                     return new OperateResult(false, $"{portName} 驱动死锁：已强制放弃句柄", -2);
                 }
+                // closeTask 先完成时取消 delay Timer
+                await timeoutCts.CancelAsync().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -440,6 +445,22 @@ namespace SerialPortService.Services
 
             oldPortNames = oldPortNames.Intersect(current).ToList();
             oldPortNames.AddRange(current.Except(oldPortNames));
+        }
+
+        /// <summary>
+        /// 释放服务持有的全部串口资源。
+        /// </summary>
+        public void Dispose()
+        {
+            // 步骤1：幂等保护，避免重复释放。
+            // 为什么：多次 Dispose 在 DI 容器销毁时可能发生。
+            // 风险点：重复关闭会产生冗余日志和竞态异常。
+            if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            {
+                return;
+            }
+
+            CloseAll();
         }
     }
 }

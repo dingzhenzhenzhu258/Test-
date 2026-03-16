@@ -20,15 +20,15 @@ namespace SerialPortService.Services.Protocols.Modbus
         private int _count = 0;
         private long _lastByteTickMs;
 
-        // 功能码处理器字典
-        private readonly Dictionary<byte, ModbusFunction> _functions;
+        // 功能码处理器数组（基于 O(1) 索引化，提升高频匹配性能）
+        private readonly ModbusFunction?[] _functions;
 
         public ModbusRtuParser()
         {
             // 步骤1：初始化功能码处理器映射。
             // 为什么：不同功能码的数据长度策略不同，需要分发到对应规则。
             // 风险点：未注册功能码会导致报文被重置丢弃。
-            _functions = new Dictionary<byte, ModbusFunction>();
+            _functions = new ModbusFunction?[256];
             
             Register(new ReadHoldingRegisters());
             Register(new WriteSingleRegister());
@@ -48,9 +48,9 @@ namespace SerialPortService.Services.Protocols.Modbus
             // 步骤1：按功能码去重注册。
             // 为什么：保证解析规则唯一，避免同码多义。
             // 风险点：重复覆盖会导致长度规则混乱。
-            if (!_functions.ContainsKey(func.Code))
+            if (_functions[func.Code] == null)
             {
-                _functions.Add(func.Code, func);
+                _functions[func.Code] = func;
             }
         }
 
@@ -105,9 +105,9 @@ namespace SerialPortService.Services.Protocols.Modbus
         {
             var nowTickMs = Environment.TickCount64;
 
-            // 步骤1：检测帧内字节间隔是否异常。
-            // 为什么：若中途丢字节导致长时间断流，应尽快重置状态机恢复同步。
-            // 风险点：不做间隔复位可能长期等待错误长度，触发连续请求超时。
+            // 步骤1：检测帧内字节间隔是否异常 (即依靠超时重置半包死锁)。
+            // 为什么：由于 Windows 线程调度精度有限, 此处时间戳检测只作为“防止无限死等”的次要辅助手段，主策略必须依赖“协议定义长度验证”。
+            // 风险点：若依赖时间片定帧长则可靠性极低，当前结合 ModbusFunction 判定长度能够抵御极端的连续高波特率字节流。
             if (_state != FrameParseState.WaitAddress
                 && _lastByteTickMs > 0
                 && nowTickMs - _lastByteTickMs > FrameAssembleGapMs)
@@ -160,7 +160,8 @@ namespace SerialPortService.Services.Protocols.Modbus
                     if ((_funcCode & 0x80) != 0)
                     {
                         // 尝试查找 ErrorFunction (0x80)
-                        if (_functions.TryGetValue(0x80, out var errFunc))
+                        var errFunc = _functions[0x80];
+                        if (errFunc != null)
                         {
                             _currentFunction = errFunc;
                             _expectedDataLen = errFunc.FixedDataLength;
@@ -175,10 +176,11 @@ namespace SerialPortService.Services.Protocols.Modbus
                     }
                     else
                     {
-                        // 步骤2.2：查找功能码处理器。
-                        // 为什么：每个功能码决定固定/变长解析策略。
+                        // 步骤2.2：查找功能码处理器（O(1) 数组索引优化）。
+                        // 为什么：每个功能码决定固定/变长解析策略，极限高频下消除 Hash 计算开销。
                         // 风险点：未知功能码若继续解析会污染状态机。
-                        if (_functions.TryGetValue(_funcCode, out var func))
+                        var func = _functions[_funcCode];
+                        if (func != null)
                         {
                             _currentFunction = func;
 
@@ -262,13 +264,12 @@ namespace SerialPortService.Services.Protocols.Modbus
                         if (CheckCrc(_buffer.AsSpan(0, totalLen)))
                         {
                             var rawFrame = _buffer.AsSpan(0, totalLen).ToArray();
-                            var packet = new ModbusPacket
-                            {
-                                SlaveId = _buffer[0],
-                                FunctionCode = _buffer[1],
-                                Data = _buffer.AsSpan(2, totalLen - 4).ToArray(),
-                                RawFrame = rawFrame
-                            };
+                            var packet = new ModbusPacket();
+                            packet.SlaveId = _buffer[0];
+                            packet.FunctionCode = _buffer[1];
+                            packet.Data = _buffer.AsSpan(2, totalLen - 4).ToArray();
+                            packet.RawFrame = rawFrame;
+
                             output.Add(packet);
                         }
                         Reset();
@@ -303,15 +304,17 @@ namespace SerialPortService.Services.Protocols.Modbus
             return receivedLo == calcLo && receivedHi == calcHi;
         }
 
-        private ushort CalculateCrc(ReadOnlySpan<byte> data)
+        // 步骤1：预计算 Modbus CRC16 查表（多项式 0xA001）。
+        // 为什么：查表法将每字节 8 次分支循环降为 1 次查表 + 异或，高频解析下 CPU 开销显著降低。
+        // 风险点：表必须与逐位算法结果完全一致，否则所有帧校验失败。
+        private static readonly ushort[] CrcTable = GenerateCrcTable();
+
+        private static ushort[] GenerateCrcTable()
         {
-            // 步骤1：执行 Modbus RTU 标准 CRC16 计算。
-            // 为什么：与设备端算法保持一致。
-            // 风险点：实现偏差会导致所有帧校验失败。
-            ushort crc = 0xFFFF;
-            for (int i = 0; i < data.Length; i++)
+            var table = new ushort[256];
+            for (int i = 0; i < 256; i++)
             {
-                crc ^= data[i];
+                ushort crc = (ushort)i;
                 for (int j = 0; j < 8; j++)
                 {
                     if ((crc & 1) != 0)
@@ -319,6 +322,20 @@ namespace SerialPortService.Services.Protocols.Modbus
                     else
                         crc >>= 1;
                 }
+                table[i] = crc;
+            }
+            return table;
+        }
+
+        private static ushort CalculateCrc(ReadOnlySpan<byte> data)
+        {
+            // 步骤1：执行 Modbus RTU 标准 CRC16 查表计算。
+            // 为什么：与设备端算法保持一致，查表法高频下性能更优。
+            // 风险点：实现偏差会导致所有帧校验失败。
+            ushort crc = 0xFFFF;
+            for (int i = 0; i < data.Length; i++)
+            {
+                crc = (ushort)((crc >> 8) ^ CrcTable[(crc ^ data[i]) & 0xFF]);
             }
             return crc;
         }

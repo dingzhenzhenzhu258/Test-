@@ -129,18 +129,42 @@ namespace SerialPortService.Services
                         // 步骤1：批量喂给解析器，逐字节状态机在 Parser.Parse 内部实现。
                         // 为什么：复用 Span 切片避免额外内存分配。
                         // 风险点：解析器状态异常会导致后续帧错位。
-                        Parser.Parse(chunk.Buffer.AsSpan(0, chunk.Length), resultList);
+                        try
+                        {
+                            Parser.Parse(chunk.Buffer.AsSpan(0, chunk.Length), resultList);
+                        }
+                        catch (Exception ex) when (!token.IsCancellationRequested)
+                        {
+                            Logger.AddLog(LogLevel.Error, $"[Parse Error] Port={Name}, ChunkLength={chunk.Length}, {ex.Message}", exception: ex);
+                            resultList.Clear();
+                            continue;
+                        }
 
                         if (resultList.Count > 0)
                         {
                             foreach (var result in resultList)
                             {
-                                OnParsed(result);
+                                try
+                                {
+                                    OnParsed(result);
+                                }
+                                catch (Exception ex) when (!token.IsCancellationRequested)
+                                {
+                                    Logger.AddLog(LogLevel.Error, $"[OnParsed Error] Port={Name}, {ex.Message}", exception: ex);
+                                }
+
                                 var handler = OnHandleChanged;
                                 if (handler != null)
                                 {
-                                    var operateResult = new OperateResult<T>(result, true, "Success");
-                                    handler(this, operateResult);
+                                    try
+                                    {
+                                        var operateResult = new OperateResult<T>(result, true, "Success");
+                                        handler(this, operateResult);
+                                    }
+                                    catch (Exception ex) when (!token.IsCancellationRequested)
+                                    {
+                                        Logger.AddLog(LogLevel.Error, $"[OnHandleChanged Error] Port={Name}, {ex.Message}", exception: ex);
+                                    }
                                 }
                             }
                             resultList.Clear();
@@ -176,7 +200,7 @@ namespace SerialPortService.Services
                     try
                     {
                         await _port.BaseStream.WriteAsync(msg.Data.AsMemory(0, msg.Data.Length), token).ConfigureAwait(false);
-                        _lastSent = msg.Data;
+                        Volatile.Write(ref _lastSent, msg.Data);
                     }
                     catch (Exception ex) when (!token.IsCancellationRequested)
                     {

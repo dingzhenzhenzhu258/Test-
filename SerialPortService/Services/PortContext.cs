@@ -24,7 +24,7 @@ namespace SerialPortService.Services
     /// </summary>
     public abstract partial class PortContext<T> : IPortContext where T : class
     {
-        private const bool EnableRawReadChunkLog = true;
+        private const bool EnableRawReadChunkLog = false;
         private const int OpenRetryAttempts = 50;
         private const int OpenRetryDelayMs = 100;
 
@@ -121,7 +121,12 @@ namespace SerialPortService.Services
 
         private static Channel<DataPacket> CreateSendChannel()
         {
-            return Channel.CreateUnbounded<DataPacket>();
+            return Channel.CreateBounded<DataPacket>(new BoundedChannelOptions(512)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = true,
+                SingleWriter = false
+            });
         }
 
         private static Channel<RentedBuffer> CreateRawInputChannel()
@@ -134,7 +139,7 @@ namespace SerialPortService.Services
             });
         }
 
-        private void EnsurePortOpenedWithRetry()
+        private async Task EnsurePortOpenedWithRetryAsync()
         {
             if (_port.IsOpen)
             {
@@ -155,7 +160,10 @@ namespace SerialPortService.Services
                     lastException = ex;
                     if (attempt < OpenRetryAttempts)
                     {
-                        Thread.Sleep(OpenRetryDelayMs);
+                        // 步骤1：使用异步延迟替代 Thread.Sleep。
+                        // 为什么：避免阻塞调用线程（可能是 UI 线程）。
+                        // 风险点：Thread.Sleep 会冻结 UI 导致"打开串口卡死"。
+                        await Task.Delay(OpenRetryDelayMs).ConfigureAwait(false);
                     }
                 }
             }
@@ -257,7 +265,11 @@ namespace SerialPortService.Services
             // 风险点：多任务并发读写同一串口会触发不可预期错误。
             if (_isRunning) return;
             Interlocked.Exchange(ref _closeSignaled, 0);
-            EnsurePortOpenedWithRetry();
+
+            // 步骤1.1：异步重试打开串口，通过 Task.Run 避免在有 SynchronizationContext 的线程上死锁。
+            // 为什么：Thread.Sleep 在 UI 线程上会冻结界面，而 .GetAwaiter().GetResult() 在有 SyncCtx 时会死锁。
+            // 风险点：Task.Run 切换到线程池执行，调用方需接受短暂的线程切换开销。
+            Task.Run(() => EnsurePortOpenedWithRetryAsync()).GetAwaiter().GetResult();
 
             _isRunning = true;
             _cts = new CancellationTokenSource();
@@ -322,7 +334,7 @@ namespace SerialPortService.Services
             // 为什么：避免业务线程直接阻塞在串口 IO。
             // 风险点：若发送队列失控，可能造成内存压力上升。
             var packet = new DataPacket(data);
-            await _sendChannel.Writer.WriteAsync(packet).ConfigureAwait(false);
+            await _sendChannel.Writer.WriteAsync(packet, default).ConfigureAwait(false);
             return data;
         }
 

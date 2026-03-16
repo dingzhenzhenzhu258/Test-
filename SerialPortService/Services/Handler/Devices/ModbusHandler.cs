@@ -13,8 +13,15 @@ namespace SerialPortService.Services.Handler
 {
     /// <summary>
     /// Modbus 处理器。
-    /// 基于 <see cref="GenericHandler{T}"/> 复用通用收发能力，
-    /// 仅保留 Modbus 特有的响应匹配规则。
+    /// 基于 <see cref="GenericHandler{T}"/> 复用通用收发能力，仅保留 Modbus 特有的响应匹配规则。
+    /// 
+    /// 【使用场景指南】
+    /// 1. 主动式控制端 (推拉结合/主动请求)：
+    ///    - 场景：作为 Client 向设备发起特定寄存器读写。
+    ///    - 推荐 API: 使用 <see cref="SendRequestAsync"/>，该方法内部提供自动重试、超时控制，适合精准请求对应响应的流程验证。
+    /// 2. 被动高频接收 (独立数据流)：
+    ///    - 场景：处理设备主动上报（或高频次底层周期性拉取），单纯监听有效帧避免挤压阻塞。
+    ///    - 推荐 API: 使用 <see cref="ReadParsedPacketsAsync"/> (<c>IAsyncEnumerable</c>)，业务只需 `await foreach` 即可连续消费完成解析的最新数据包，独立于发送请求的流控制。
     /// </summary>
     public class ModbusHandler : GenericHandler<ModbusPacket>, IModbusContext
     {

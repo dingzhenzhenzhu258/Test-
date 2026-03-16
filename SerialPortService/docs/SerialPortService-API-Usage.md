@@ -18,6 +18,21 @@
 2. 对 `IsSuccess=false` 执行统一策略（限次重试、降级、告警、审计）。
 3. 仅在需要中断流程时使用 `Write` 并捕获异常。
 
+## 场景：主动式派发 vs 被动高频接收
+
+根据团队的 `copilot-instructions` 规范，在此明确在使用 `GenricHandler` 或特定协议（如 `ModbusHandler`）时，针对不同的通信应用场景：
+
+- **主动式控制端 (主动派发 / Push via Request)**  
+  建议使用带有明确超时重试功能的同步等待机制。  
+  **推荐 API:** `SendRequestAsync(byte[] command, int timeout = 1000, int retryCount = 3)`  
+  **适用场景:** 作为上位机控制下位机，下发开启激光、回原点、查询特定寄存器值，必须收到匹配该功能码和节点号的准确回应。
+
+- **被动高频收集 (流式推流 / Pull via Stream)**  
+  建议采用不会阻塞底层通道的流式读取机制。  
+  **推荐 API:** `ReadParsedPacketsAsync(CancellationToken cancellationToken = default)` （返回 `IAsyncEnumerable<T>`）  
+  **适用场景:** 设备主动上报状态数据（如连续高配比温度监测流或持续的测距传感器流）。业务层只需通过 `await foreach(var packet in handler.ReadParsedPacketsAsync(...))` 进行不停接收和归档即可，脱离请求/响应强绑定生命周期。  
+  *附注: 为了减缓极限通信下的堆内存压力，已针对 `ModbusPacket` 暴露了静态对象级缓存 `ModbusPacket.Rent()` 和 `ModbusPacket.Return(...)` 支持。在被动推流收集后若无长时间持久化必要，请通过 `Return` 还给池子。*
+
 ## 典型失败分支
 
 - 串口未打开：`Message` 包含“未打开”。
@@ -103,6 +118,25 @@ protected override void OnParsed(ModbusPacket pkt)
 - 若使用 `ReadParsedPacketsAsync`，请传入 `CancellationToken` 并确保消费者能跟上生产速率；否则可能触发通道丢包（默认是 DropOldest）。
 - `OnHandleChanged` 回调可能在解析线程触发；若在 UI 使用需切换线程上下文。
 - 不建议对每条报文执行 `_ = Task.Run(...)`；高吞吐长跑下容易造成任务堆积、线程池抖动和后续超时。
+
+### 适用场景与接口选择指南
+
+针对不同类型的硬件设备与业务需求，推荐遵循以下原则选择正确的收发接口：
+
+#### 1. 持续被动采集（未经请求数据主动上报）
+* **代表设备**：扫码枪、连续称重电子秤、心跳业务、定频RFID扫描器。
+* **适用接口**：**强烈推荐**使用异步流 `ReadParsedPacketsAsync`。
+* **原因**：设备随时产生无法预测体量的突发数据。使用 `await foreach` 配合后台长任务，通过底层 Channel 缓冲区平滑削峰，完美应对流量突变且无需手动调度线程。
+
+#### 2. 半主动/订阅型连续采集（一次指令，连绵不断）
+* **代表设备**：需要上位机发送“开始测试”指令后，才以较高频率持续爆传数据的仪器。
+* **适用接口**：**非常适用**异步流 `ReadParsedPacketsAsync`。
+* **原因**：通过 `TryWrite` 发送单挑指令后，下机挂起一个 `await foreach` 的长期消费工作流接收连续测试结果，直到下发或者接收到“停止测试”信号（借由 `CancellationToken` 取消消费）。
+
+#### 3. 传统主从“一问一答”（被动从站式主动轮询）
+* **代表设备**：标准 Modbus 从站（如各类温湿度计、常规PLC寄存器读写），完全遵守“不问不说”的应答纪律。
+* **适用接口**：**坚决推荐**使用带匹配语义的 `SendRequestAsync`（如 `IModbusContext.SendRequestAsync`）。**不推荐**用流式接收。
+* **原因**：`SendRequestAsync` 内部天然集成了发送、挂起等待、特征字匹配与超时重试。如果在此场景强行用 `ReadParsedPacketsAsync` 等待数据，需要在业务层重新开发异常脆弱的请求序号映射（Request-Id mapping），违背了组件的设计初衷。
 
 ## 配置片段（appsettings.json 示例）
 
