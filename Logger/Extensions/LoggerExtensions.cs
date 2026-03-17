@@ -448,13 +448,11 @@ namespace Logger.Extensions
                 .Enrich.WithProperty("MachineName", GlobalDeviceInfo.MachineName)
                 .Enrich.WithProperty("AppVersion", GlobalDeviceInfo.AppVersion)
                 .Enrich.WithProperty("IPAddress", GlobalDeviceInfo.IpAddress)
-                .Enrich.WithProperty("MACAddress", GlobalDeviceInfo.MacAddress)
-                .WriteTo.Console()
-                .WriteTo.File(
-                    path: Path.Combine("logs", "fallback.log"),
-                    rollingInterval: RollingInterval.Day,
-                    retainedFileCountLimit: 14,
-                    shared: true);
+                .Enrich.WithProperty("MACAddress", GlobalDeviceInfo.MacAddress);
+
+            // 步骤1：仅保留配置文件中的常规 sink，不再把 fallback.log 作为常驻文件 sink。
+            // 为什么：避免 app.log 与 fallback.log 同时写入同一批业务日志，造成重复落盘。
+            // 风险点：fallback.log 现在只用于 OTLP 失败提示和补传异常，不再承载常规业务日志。
 
             if (enableOtlp)
             {
@@ -631,7 +629,7 @@ namespace Logger.Extensions
                 }
 
                 SetOtlpAvailability(false);
-                WriteOtlpFallbackNotice($"OTLP 导出异常，已自动回退到文件日志（logs/fallback.log）。原始消息: {message}");
+                WriteOtlpFallbackNotice($"OTLP 导出异常。常规业务日志继续写入 app.log，fallback.log 仅记录 OTLP 失败/恢复提示与补传异常。原始消息: {message}");
             });
         }
 

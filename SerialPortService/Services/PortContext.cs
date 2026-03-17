@@ -24,8 +24,19 @@ namespace SerialPortService.Services
     /// </summary>
     public abstract partial class PortContext<T> : IPortContext where T : class
     {
-        private const bool EnableRawReadChunkLog = false;
+        // 步骤1：控制是否输出每次原始读块日志。
+        // 为什么：便于在排查串口分包、粘包、吞包问题时观察底层读取行为。
+        // 风险点：开启后高频串口场景会产生大量日志，可能影响性能并放大磁盘占用。
+        private const bool EnableRawReadChunkLog = true;
+
+        // 步骤2：定义串口打开失败时的最大重试次数。
+        // 为什么：部分驱动或系统句柄释放存在短暂延迟，重试可提升重新打开成功率。
+        // 风险点：次数过大时，最终失败前的等待时间会变长，影响调用方响应速度。
         private const int OpenRetryAttempts = 50;
+
+        // 步骤3：定义每次打开重试之间的等待间隔。
+        // 为什么：给系统和驱动留出释放串口占用状态的时间，避免立即重试持续失败。
+        // 风险点：间隔过短可能无效重试过多，间隔过长则会拉长打开耗时。
         private const int OpenRetryDelayMs = 100;
 
         /// <summary>

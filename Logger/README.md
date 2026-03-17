@@ -63,7 +63,8 @@ app.SubscribeGlobalExceptions(logger);
 
 - 若 `OTLP` 可达：正常启用日志/追踪/指标导出。
 - 若 `OTLP` 不可达：
-  - 日志自动回退到本地 `logs/fallback.log`；
+  - 常规业务日志继续写入本地 `logs/app.log`；
+  - `logs/fallback.log` 仅记录 `OTLP` 失败/恢复提示与补传异常；
   - 记录明确告警；
   - 启动后台恢复探测。
 
@@ -105,7 +106,7 @@ app.SubscribeGlobalExceptions(logger);
 `Serilog`：
 
 - `MinimumLevel`：默认及覆盖级别
-- `WriteTo`：控制台/文件输出模板
+- `WriteTo`：控制台/常规文件输出模板（默认业务日志写入 `logs/app.log`）
 - `Enrich`：附加上下文（线程、LogContext 等）
 
 ---
