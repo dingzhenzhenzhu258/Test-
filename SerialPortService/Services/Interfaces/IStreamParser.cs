@@ -11,17 +11,17 @@ namespace SerialPortService.Services.Interfaces
     public interface IStreamParser<T>
     {
         /// <summary>
-        /// 输入一个字节，尝试解析 (适用于简单状态机)
+        /// 输入一个字节并尝试解析（适用于简单状态机）。
         /// </summary>
         /// <param name="b">输入的字节</param>
-        /// <param name="result">如果成功，输出结果</param>
+        /// <param name="result">解析成功时输出结果</param>
         /// <returns>是否解析成功</returns>
         bool TryParse(byte b, [NotNullWhen(true)] out T? result);
 
         /// <summary>
-        /// 解析输入数据流 (适用于高性能批量处理)
+        /// 解析输入数据流（适用于高性能批量处理）。
         /// </summary>
-        /// <param name="data">输入的数据块 (Span 高效传递)</param>
+        /// <param name="data">输入的数据块（使用 <see cref="ReadOnlySpan{T}"/> 高效传递）</param>
         /// <param name="output">用于存储解析结果的列表</param>
         /// <remarks>
         /// 默认实现：循环调用 TryParse。
@@ -45,7 +45,7 @@ namespace SerialPortService.Services.Interfaces
         }
 
         /// <summary>
-        /// 重置状态机
+        /// 重置解析状态机。
         /// </summary>
         void Reset();
     }

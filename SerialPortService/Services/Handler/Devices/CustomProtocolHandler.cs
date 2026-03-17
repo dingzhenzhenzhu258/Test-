@@ -33,10 +33,19 @@ namespace SerialPortService.Services.Handler
                 return response.Command == expectedCommand;
             }
 
+            /// <summary>
+            /// 判断当前帧是否属于设备主动上报。
+            /// </summary>
             public bool IsReportPacket(CustomFrame response) => false;
 
+            /// <summary>
+            /// 处理主动上报帧。
+            /// </summary>
             public void OnReportPacket(CustomFrame response) { }
 
+            /// <summary>
+            /// 构建未匹配响应的诊断日志文本。
+            /// </summary>
             public string BuildUnmatchedLog(CustomFrame response)
                 => $"Cmd=0x{response.Command:X2}, Raw={BitConverter.ToString(response.Raw)}";
         }
@@ -52,6 +61,12 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 构建协议帧并发送请求，等待匹配响应。
         /// </summary>
+        /// <param name="command">协议命令字</param>
+        /// <param name="payload">可选负载</param>
+        /// <param name="timeout">单次请求超时时间（毫秒）</param>
+        /// <param name="retryCount">超时后的重试次数</param>
+        /// <param name="cancellationToken">外部取消令牌</param>
+        /// <returns>解析完成的自定义协议响应帧</returns>
         public async Task<CustomFrame> SendRequestAsync(byte command, byte[]? payload = null, int timeout = 1000, int retryCount = 3, CancellationToken cancellationToken = default)
         {
             // 步骤1：构建协议请求帧。

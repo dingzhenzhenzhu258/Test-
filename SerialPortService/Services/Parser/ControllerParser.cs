@@ -10,11 +10,17 @@ namespace SerialPortService.Services.Parser
     /// </summary>
     public class ControllerParser : IStreamParser<string>
     {
+        /// <summary>
+        /// 控制器定长帧缓冲区。
+        /// </summary>
         private readonly byte[] _buffer = new byte[6];
         private int _index = 0;
 
         // 默认 Parse 方法会调用 TryParse，这里不需要重写 Parse
 
+        /// <summary>
+        /// 逐字节尝试解析控制器固定长度帧。
+        /// </summary>
         public bool TryParse(byte b, [NotNullWhen(true)] out string? result)
         {
             // 步骤1：默认结果置空。
@@ -47,6 +53,9 @@ namespace SerialPortService.Services.Parser
             return false;
         }
 
+        /// <summary>
+        /// 重置控制器解析状态。
+        /// </summary>
         public void Reset()
         {
             // 步骤1：重置解析索引。

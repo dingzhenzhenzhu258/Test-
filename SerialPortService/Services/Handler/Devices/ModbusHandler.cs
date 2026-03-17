@@ -31,6 +31,12 @@ namespace SerialPortService.Services.Handler
         /// </summary>
         private sealed class ModbusResponseMatcher : IResponseMatcher<ModbusPacket>
         {
+            /// <summary>
+            /// 判断响应报文是否与当前请求匹配。
+            /// </summary>
+            /// <param name="response">响应报文</param>
+            /// <param name="command">原始请求报文</param>
+            /// <returns>是否匹配</returns>
             public bool IsResponseMatch(ModbusPacket response, byte[] command)
             {
                 if (response == null || command == null || command.Length < 2) return false;
@@ -41,10 +47,19 @@ namespace SerialPortService.Services.Handler
                 return response.SlaveId == slaveId && actualFunc == funcCode;
             }
 
+            /// <summary>
+            /// 判断当前报文是否为主动上报报文。
+            /// </summary>
             public bool IsReportPacket(ModbusPacket response) => false;
 
+            /// <summary>
+            /// 处理主动上报报文。
+            /// </summary>
             public void OnReportPacket(ModbusPacket response) { }
 
+            /// <summary>
+            /// 构建未匹配报文的诊断日志。
+            /// </summary>
             public string BuildUnmatchedLog(ModbusPacket response)
                 => $"Slave={response.SlaveId}, Func=0x{response.FunctionCode:X2}, Raw={BitConverter.ToString(response.RawFrame)}";
         }
@@ -52,16 +67,25 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 创建 Modbus 处理器。
         /// </summary>
+        /// <param name="portName">串口名称</param>
+        /// <param name="baudRate">波特率</param>
+        /// <param name="parity">校验位</param>
+        /// <param name="dataBits">数据位</param>
+        /// <param name="stopBits">停止位</param>
+        /// <param name="logger">日志实例</param>
+        /// <param name="options">通用处理器配置</param>
         public ModbusHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger, GenericHandlerOptions? options = null)
             : base(portName, baudRate, parity, dataBits, stopBits, new ModbusRtuParser(), logger, options, new ModbusResponseMatcher())
         {
         }
 
         /// <summary>
-        /// 发送 Modbus 请求并等待响应 (同步转异步)
+        /// 发送 Modbus 请求并等待响应。
         /// </summary>
         /// <param name="command">完整的 Modbus 报文</param>
         /// <param name="timeout">超时时间 (毫秒)</param>
+        /// <param name="retryCount">超时后的重试次数</param>
+        /// <param name="cancellationToken">外部取消令牌</param>
         /// <returns>响应报文</returns>
         public async Task<ModbusPacket> SendRequestAsync(byte[] command, int timeout = 1000, int retryCount = 3, CancellationToken cancellationToken = default)
             // 步骤1：复用通用发送核心流程。
@@ -73,6 +97,8 @@ namespace SerialPortService.Services.Handler
         /// 读取解析完成的 Modbus 报文流。
         /// 解析线程产出完整报文后写入通道，业务线程可独立异步消费。
         /// </summary>
+        /// <param name="cancellationToken">读取取消令牌</param>
+        /// <returns>解析后的 Modbus 报文异步流</returns>
         public override IAsyncEnumerable<ModbusPacket> ReadParsedPacketsAsync(CancellationToken cancellationToken = default)
             => base.ReadParsedPacketsAsync(cancellationToken);
     }

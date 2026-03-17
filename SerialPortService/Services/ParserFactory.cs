@@ -17,8 +17,10 @@ namespace SerialPortService.Services
     public static class ParserFactory
     {
         /// <summary>
-        /// 根据协议枚举，创建 Modbus 系列的解析器
+        /// 根据协议枚举创建 Modbus 系列解析器。
         /// </summary>
+        /// <param name="protocol">协议类型</param>
+        /// <returns>对应的 Modbus 解析器实例</returns>
         public static IStreamParser<ModbusPacket> CreateModbusParser(ProtocolEnum protocol)
         {
             // 步骤1：按协议枚举分派解析器实现。
@@ -40,6 +42,7 @@ namespace SerialPortService.Services
         /// <summary>
         /// 创建自定义协议解析器。
         /// </summary>
+        /// <returns>自定义协议解析器实例</returns>
         public static IStreamParser<CustomFrame> CreateCustomProtocolParser()
         {
             // 步骤1：返回自定义协议解析器实例。

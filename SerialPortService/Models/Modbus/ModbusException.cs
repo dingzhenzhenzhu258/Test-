@@ -15,6 +15,8 @@ namespace SerialPortService.Models
         /// <summary>
         /// 使用异常码与消息创建 Modbus 异常。
         /// </summary>
+        /// <param name="errorCode">Modbus 异常码</param>
+        /// <param name="message">异常说明</param>
         public ModbusException(byte? errorCode, string message) : base(message)
         {
             ErrorCode = errorCode;

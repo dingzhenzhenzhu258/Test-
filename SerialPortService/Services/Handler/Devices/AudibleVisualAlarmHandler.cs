@@ -10,6 +10,9 @@ namespace SerialPortService.Services.Handler
     /// </summary>
     public class AudibleVisualAlarmHandler : ParserPortContext<string>
     {
+        /// <summary>
+        /// 创建声光报警器处理器。
+        /// </summary>
         public AudibleVisualAlarmHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
             : base(portName, baudRate, parity, dataBits, stopBits, logger)
         {
@@ -19,9 +22,13 @@ namespace SerialPortService.Services.Handler
             SetParser(new AlarmParser(() => _lastSent));
         }
 
-        // =================================================================
-        // 静态工具方法 (保持不变)
-        // =================================================================
+        /// <summary>
+        /// 按协议生成报警器控制命令。
+        /// </summary>
+        /// <param name="led">LED 模式</param>
+        /// <param name="buzzer">蜂鸣器模式</param>
+        /// <param name="flash">闪光频率</param>
+        /// <returns>完整 5 字节命令帧</returns>
         public static byte[] BuildCommand(LedMode led, BuzzerMode buzzer, FlashFrequency flash)
         {
             // 步骤1：按设备协议固定格式组帧。

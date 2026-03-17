@@ -16,6 +16,9 @@ namespace SerialPortService.Services.Handler
         long WaitBacklog,
         long WaitBacklogHighWatermark)
     {
+        /// <summary>
+        /// 平均成功匹配延迟（毫秒）。
+        /// </summary>
         public double AverageLatencyMs => MatchedCount == 0 ? 0 : (double)TotalLatencyMs / MatchedCount;
     }
 }

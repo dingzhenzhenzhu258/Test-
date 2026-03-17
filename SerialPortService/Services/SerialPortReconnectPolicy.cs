@@ -7,9 +7,24 @@ namespace SerialPortService.Services
     /// </summary>
     internal static class SerialPortReconnectPolicy
     {
+        /// <summary>
+        /// 当前重连间隔毫秒值。
+        /// </summary>
         private static int _reconnectIntervalMs = 1000;
+
+        /// <summary>
+        /// 当前最大重连尝试次数。
+        /// </summary>
         private static int _maxReconnectAttempts = 3;
+
+        /// <summary>
+        /// 当前重连失败率告警阈值百分比。
+        /// </summary>
         private static int _reconnectFailureRateAlertThresholdPercent = 30;
+
+        /// <summary>
+        /// 当前重连失败率告警最小样本数。
+        /// </summary>
         private static int _reconnectFailureRateAlertMinSamples = 20;
 
         /// <summary>
@@ -37,6 +52,10 @@ namespace SerialPortService.Services
         /// 时间/次数类参数仅当输入值大于 0 时生效；
         /// 失败率阈值支持 0~100（0 表示关闭该类告警）。
         /// </summary>
+        /// <param name="reconnectIntervalMs">重连间隔（毫秒）</param>
+        /// <param name="maxReconnectAttempts">最大重连次数</param>
+        /// <param name="reconnectFailureRateAlertThresholdPercent">重连失败率告警阈值</param>
+        /// <param name="reconnectFailureRateAlertMinSamples">重连失败率告警最小样本数</param>
         public static void Configure(int reconnectIntervalMs, int maxReconnectAttempts, int reconnectFailureRateAlertThresholdPercent, int reconnectFailureRateAlertMinSamples)
         {
             // 步骤1：更新重连间隔。

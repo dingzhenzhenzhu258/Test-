@@ -15,6 +15,9 @@ namespace SerialPortService.Services.Handler
     /// </summary>
     public class TemperatureSensorHandler : ModbusHandler
     {
+        /// <summary>
+        /// 创建温湿度传感器处理器。
+        /// </summary>
         public TemperatureSensorHandler(
             string portName,
             int baudRate,

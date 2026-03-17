@@ -19,11 +19,27 @@ namespace SerialPortService.Services
         // 为什么：业务方可在任意时刻注册外部工厂，不受服务实例生命周期约束。
         // 风险点：静态状态在多实例场景下会相互影响，注册前需确认唯一性。
         private static readonly ConcurrentDictionary<HandleEnum, ISerialPortService.PortContextFactory> _handlerFactories = new();
+
+        /// <summary>
+        /// 设备类型到协议类型的动态推断函数。
+        /// </summary>
         private static Func<HandleEnum, ProtocolEnum>? _protocolResolver;
 
+        /// <summary>
+        /// 用于创建各处理器日志实例的工厂。
+        /// </summary>
         private readonly ILoggerFactory _loggerFactory;
+
+        /// <summary>
+        /// 通用处理器基础配置。
+        /// </summary>
         private readonly GenericHandlerOptions _options;
 
+        /// <summary>
+        /// 创建串口上下文工厂。
+        /// </summary>
+        /// <param name="loggerFactory">日志工厂</param>
+        /// <param name="options">通用处理器基础配置</param>
         public PortContextFactory(ILoggerFactory loggerFactory, GenericHandlerOptions options)
         {
             _loggerFactory = loggerFactory;
@@ -33,18 +49,25 @@ namespace SerialPortService.Services
         /// <summary>
         /// 注册外部设备处理器工厂。
         /// </summary>
+        /// <param name="handleEnum">设备类型</param>
+        /// <param name="factory">外部上下文工厂</param>
+        /// <returns>是否注册成功</returns>
         public bool RegisterHandlerFactory(HandleEnum handleEnum, ISerialPortService.PortContextFactory factory)
             => _handlerFactories.TryAdd(handleEnum, factory);
 
         /// <summary>
         /// 设置协议推断函数。
         /// </summary>
+        /// <param name="resolver">设备类型到协议类型的解析函数</param>
         public void SetProtocolResolver(Func<HandleEnum, ProtocolEnum> resolver)
             => _protocolResolver = resolver;
 
         /// <summary>
         /// 基于基础配置构建附带标签的 <see cref="GenericHandlerOptions"/>。
         /// </summary>
+        /// <param name="handleEnum">设备类型标签</param>
+        /// <param name="protocol">协议标签</param>
+        /// <returns>附带标签的处理器配置</returns>
         public GenericHandlerOptions CreateTaggedOptions(HandleEnum handleEnum, ProtocolEnum protocol)
         {
             // 步骤1：复制基础配置并附加标签。
@@ -72,6 +95,14 @@ namespace SerialPortService.Services
         /// <summary>
         /// 根据设备类型与协议创建 <see cref="IPortContext"/>。
         /// </summary>
+        /// <param name="portName">串口名称</param>
+        /// <param name="baudRate">波特率</param>
+        /// <param name="parity">校验位</param>
+        /// <param name="dataBits">数据位</param>
+        /// <param name="stopBits">停止位</param>
+        /// <param name="handleEnum">设备类型</param>
+        /// <param name="protocol">协议类型</param>
+        /// <returns>上下文实例及最终解析出的协议类型</returns>
         public (IPortContext Context, ProtocolEnum ResolvedProtocol) Create(
             string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits,
             HandleEnum handleEnum, ProtocolEnum protocol)

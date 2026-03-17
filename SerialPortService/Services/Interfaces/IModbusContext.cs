@@ -26,6 +26,7 @@ namespace SerialPortService.Services.Interfaces
         /// 适用于高速采集场景：解析线程生产完整报文，业务线程异步消费。
         /// </summary>
         /// <param name="cancellationToken">读取取消令牌</param>
+        /// <returns>解析后的 Modbus 报文异步流</returns>
         IAsyncEnumerable<ModbusPacket> ReadParsedPacketsAsync(CancellationToken cancellationToken = default);
     }
 }

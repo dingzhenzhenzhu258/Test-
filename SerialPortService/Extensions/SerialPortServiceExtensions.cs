@@ -38,6 +38,11 @@ namespace SerialPortService.Extensions
         }
 
         /// <summary>
+        /// 从配置中读取 <see cref="GenericHandlerOptions"/> 相关选项时使用的节路径。
+        /// </summary>
+        private const string GenericHandlerOptionsSection = "SerialPortService:GenericHandlerOptions";
+
+        /// <summary>
         /// 基于配置注册串口服务，并对关键参数执行安全归一化。
         /// </summary>
         /// <param name="services">服务集合</param>

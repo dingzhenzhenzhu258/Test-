@@ -29,6 +29,12 @@ namespace SerialPortService.Services.Handler
         private readonly byte _slaveId;
         private readonly ILogger _logger;
 
+        /// <summary>
+        /// 记录十六进制报文日志。
+        /// </summary>
+        /// <param name="level">日志级别</param>
+        /// <param name="prefix">日志前缀</param>
+        /// <param name="frame">待输出报文</param>
         private void LogHexFrame(LogLevel level, string prefix, byte[] frame)
         {
             if (_logger.IsEnabled(level))
@@ -58,6 +64,9 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 03 Read Holding Registers (读保持寄存器)
         /// </summary>
+        /// <param name="startAddress">起始寄存器地址</param>
+        /// <param name="count">读取寄存器数量</param>
+        /// <param name="cancellationToken">外部取消令牌</param>
         /// <returns>寄存器数据 (字节数组，长度为 count*2)</returns>
         public async Task<byte[]> ReadHoldingRegistersAsync(ushort startAddress, ushort count, CancellationToken cancellationToken = default)
         {
@@ -128,6 +137,9 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 06 Write Single Register（写单个寄存器）。
         /// </summary>
+        /// <param name="address">目标寄存器地址</param>
+        /// <param name="value">要写入的寄存器值</param>
+        /// <param name="cancellationToken">外部取消令牌</param>
         public async Task WriteSingleRegisterAsync(ushort address, ushort value, CancellationToken cancellationToken = default)
         {
             // 步骤1：构建并发送 06 指令。
@@ -162,6 +174,9 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 10 Write Multiple Registers（写多个寄存器）。
         /// </summary>
+        /// <param name="startAddress">起始寄存器地址</param>
+        /// <param name="values">连续写入的寄存器值集合</param>
+        /// <param name="cancellationToken">外部取消令牌</param>
         public async Task WriteMultipleRegistersAsync(ushort startAddress, ushort[] values, CancellationToken cancellationToken = default)
         {
             // 步骤1：校验批量写入参数。
@@ -217,6 +232,7 @@ namespace SerialPortService.Services.Handler
         /// 批量优化写入：自动将连续地址合并为 0x10 命令
         /// </summary>
         /// <param name="writes">待写入的地址和值列表</param>
+        /// <param name="cancellationToken">外部取消令牌</param>
         public async Task BatchWriteAsync(IEnumerable<(ushort Address, ushort Value)> writes, CancellationToken cancellationToken = default)
         {
             // 步骤1：参数空值校验。

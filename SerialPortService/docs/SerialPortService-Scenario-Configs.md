@@ -4,6 +4,17 @@
 
 注意：配置项位于 `SerialPortService:GenericHandlerOptions`，并可通过 `configuration.GetSection("SerialPortService:GenericHandlerOptions").Get<GenericHandlerOptions>()` 绑定。
 
+## 先选接口，再选配置
+
+不同业务模式，建议先确定 API 选择，再调配置：
+
+| 业务模式 | 推荐接口 | 推荐配置倾向 |
+| --- | --- | --- |
+| 主动请求 / 一问一答 | `SendRequestAsync(...)` | 更关注 `TimeoutMs`、`RetryCount`、`ReconnectIntervalMs` |
+| 被动持续上报 / 高频采集 | `ReadParsedPacketsAsync(...)` | 更关注 `ResponseChannelCapacity`、`ResponseChannelFullMode`、`WaitModeQueueCapacity` |
+| 仅发送命令 | `TryWrite(...)` | 更关注失败处理、重连参数和调用方重试策略 |
+| UI / 轻量通知 | `OnHandleChanged` | 更关注 UI 线程切换，配置通常沿用默认生产值 |
+
 场景 A：默认生产（通用启动值）
 
 ```json

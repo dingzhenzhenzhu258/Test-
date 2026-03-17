@@ -11,8 +11,14 @@ namespace SerialPortService.Services.Handler
     /// <typeparam name="T">解析结果类型</typeparam>
     public abstract class ParserPortContext<T> : PortContext<T> where T : class
     {
+        /// <summary>
+        /// 固定绑定的流式解析器实例。
+        /// </summary>
         private IStreamParser<T>? _parser;
 
+        /// <summary>
+        /// 创建仅初始化串口参数的解析上下文。
+        /// </summary>
         protected ParserPortContext(
             string portName,
             int baudRate,
@@ -24,6 +30,9 @@ namespace SerialPortService.Services.Handler
         {
         }
 
+        /// <summary>
+        /// 创建并立即绑定解析器的串口上下文。
+        /// </summary>
         protected ParserPortContext(
             string portName,
             int baudRate,
@@ -37,6 +46,10 @@ namespace SerialPortService.Services.Handler
             SetParser(parser);
         }
 
+        /// <summary>
+        /// 绑定解析器实例。
+        /// </summary>
+        /// <param name="parser">流式解析器</param>
         protected void SetParser(IStreamParser<T> parser)
         {
             // 步骤1：注入并保存固定解析器实例。
@@ -50,6 +63,9 @@ namespace SerialPortService.Services.Handler
             _parser = parser ?? throw new ArgumentNullException(nameof(parser));
         }
 
+        /// <summary>
+        /// 获取当前已绑定的解析器实例。
+        /// </summary>
         protected sealed override IStreamParser<T> Parser
             => _parser ?? throw new InvalidOperationException("Parser has not been configured.");
     }

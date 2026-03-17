@@ -13,16 +13,34 @@ namespace SerialPortService.Services.Protocols.Modbus
     /// </summary>
     public class ModbusRtuParser : IStreamParser<ModbusPacket>
     {
+        /// <summary>
+        /// 判定半包失效的最大字节间隔（毫秒）。
+        /// </summary>
         private const int FrameAssembleGapMs = 50;
 
-        // 固定缓冲区
+        /// <summary>
+        /// 当前候选帧的固定接收缓冲区。
+        /// </summary>
         private readonly byte[] _buffer = new byte[512];
+
+        /// <summary>
+        /// 当前缓冲区内已接收的字节数。
+        /// </summary>
         private int _count = 0;
+
+        /// <summary>
+        /// 最近一次接收字节的时间戳。
+        /// </summary>
         private long _lastByteTickMs;
 
-        // 功能码处理器数组（基于 O(1) 索引化，提升高频匹配性能）
+        /// <summary>
+        /// 功能码处理器查找表。
+        /// </summary>
         private readonly ModbusFunction?[] _functions;
 
+        /// <summary>
+        /// 创建 Modbus RTU 解析器并注册功能码规则。
+        /// </summary>
         public ModbusRtuParser()
         {
             // 步骤1：初始化功能码处理器映射。
@@ -35,7 +53,9 @@ namespace SerialPortService.Services.Protocols.Modbus
             Register(new WriteMultipleRegisters());
             Register(new ErrorFunction());
             
-            // 注册自定义功能码
+            // 步骤2：注册扩展功能码。
+            // 为什么：支持项目内设备定义的私有 Modbus 响应格式。
+            // 风险点：若遗漏注册，自定义功能码帧会被当作未知帧丢弃。
             Register(new CustomFunction44());
             Register(new CustomFunction42());
             Register(new CustomFunction45());
@@ -43,6 +63,10 @@ namespace SerialPortService.Services.Protocols.Modbus
             Register(new CustomFunction50());
         }
 
+        /// <summary>
+        /// 注册单个功能码处理器。
+        /// </summary>
+        /// <param name="func">功能码处理规则</param>
         private void Register(ModbusFunction func)
         {
             // 步骤1：按功能码去重注册。
@@ -54,18 +78,35 @@ namespace SerialPortService.Services.Protocols.Modbus
             }
         }
 
-        // 帧解析状态
+        /// <summary>
+        /// Modbus RTU 帧解析状态。
+        /// </summary>
         private enum FrameParseState
         {
-            WaitAddress,    // 等待地址
-            WaitFuncCode,   // 等待功能码
-            WaitData,       // 等待数据区
-            WaitCRC         // 等待CRC
+            WaitAddress,
+            WaitFuncCode,
+            WaitData,
+            WaitCRC
         }
 
+        /// <summary>
+        /// 当前状态机所处阶段。
+        /// </summary>
         private FrameParseState _state = FrameParseState.WaitAddress;
+
+        /// <summary>
+        /// 当前帧的功能码。
+        /// </summary>
         private byte _funcCode;
+
+        /// <summary>
+        /// 当前帧预计数据区长度。
+        /// </summary>
         private int _expectedDataLen;
+
+        /// <summary>
+        /// 当前帧对应的功能码处理规则。
+        /// </summary>
         private ModbusFunction? _currentFunction;
 
         /// <summary>
@@ -89,6 +130,11 @@ namespace SerialPortService.Services.Protocols.Modbus
             return false;
         }
 
+        /// <summary>
+        /// 批量解析输入字节块并输出完整 Modbus 报文。
+        /// </summary>
+        /// <param name="data">当前读取到的字节块</param>
+        /// <param name="output">解析产出的报文集合</param>
         public void Parse(ReadOnlySpan<byte> data, List<ModbusPacket> output)
         {
             // 步骤1：逐字节驱动状态机。
@@ -101,6 +147,11 @@ namespace SerialPortService.Services.Protocols.Modbus
             }
         }
 
+        /// <summary>
+        /// 推进一次状态机并尝试产出完整报文。
+        /// </summary>
+        /// <param name="b">当前字节</param>
+        /// <param name="output">解析产出集合</param>
         private void ParseByte(byte b, List<ModbusPacket> output)
         {
             var nowTickMs = Environment.TickCount64;
@@ -241,7 +292,9 @@ namespace SerialPortService.Services.Protocols.Modbus
                         }
                     }
                     
-                    // 检查是否收够了数据
+                    // 步骤2.4.4：判断数据区是否已接收完成。
+                    // 为什么：只有数据区完整后才能开始 CRC 校验。
+                    // 风险点：过早或过晚切换状态都会导致整帧判定错误。
                     if (_expectedDataLen > 0 && dataLenSoFar >= _expectedDataLen)
                     {
                         _state = FrameParseState.WaitCRC;
@@ -278,6 +331,9 @@ namespace SerialPortService.Services.Protocols.Modbus
             }
         }
 
+        /// <summary>
+        /// 重置 Modbus RTU 解析状态机。
+        /// </summary>
         public void Reset()
         {
             // 步骤1：重置解析状态机。
@@ -290,6 +346,11 @@ namespace SerialPortService.Services.Protocols.Modbus
             _currentFunction = null;
         }
 
+        /// <summary>
+        /// 校验当前候选帧的 CRC16 是否正确。
+        /// </summary>
+        /// <param name="frame">待校验的完整帧</param>
+        /// <returns>CRC 是否通过</returns>
         private bool CheckCrc(ReadOnlySpan<byte> frame)
         {
             // 步骤1：读取报文尾部 CRC 并与计算值比对。
@@ -309,6 +370,10 @@ namespace SerialPortService.Services.Protocols.Modbus
         // 风险点：表必须与逐位算法结果完全一致，否则所有帧校验失败。
         private static readonly ushort[] CrcTable = GenerateCrcTable();
 
+        /// <summary>
+        /// 生成 Modbus CRC16 查找表。
+        /// </summary>
+        /// <returns>256 项 CRC 查找表</returns>
         private static ushort[] GenerateCrcTable()
         {
             var table = new ushort[256];
@@ -327,6 +392,11 @@ namespace SerialPortService.Services.Protocols.Modbus
             return table;
         }
 
+        /// <summary>
+        /// 计算指定字节序列的 Modbus CRC16。
+        /// </summary>
+        /// <param name="data">待计算数据</param>
+        /// <returns>CRC16 校验值</returns>
         private static ushort CalculateCrc(ReadOnlySpan<byte> data)
         {
             // 步骤1：执行 Modbus RTU 标准 CRC16 查表计算。

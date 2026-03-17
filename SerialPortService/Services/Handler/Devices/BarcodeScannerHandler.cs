@@ -15,6 +15,9 @@ namespace SerialPortService.Services.Handler
     /// </summary>
     public class BarcodeScannerHandler : ParserPortContext<string>
     {
+        /// <summary>
+        /// 创建扫码枪处理器。
+        /// </summary>
         public BarcodeScannerHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
             : base(portName, baudRate, parity, dataBits, stopBits, new BarcodeParser(), logger)
         {

@@ -15,6 +15,9 @@ namespace SerialPortService.Services.Handler
     /// </summary>
     public class ControllerHandler : ParserPortContext<string>
     {
+        /// <summary>
+        /// 创建控制器处理器。
+        /// </summary>
         public ControllerHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
             : base(portName, baudRate, parity, dataBits, stopBits, new ControllerParser(), logger)
         {

@@ -20,7 +20,14 @@
 
 ## 场景：主动式派发 vs 被动高频接收
 
-根据团队的 `copilot-instructions` 规范，在此明确在使用 `GenricHandler` 或特定协议（如 `ModbusHandler`）时，针对不同的通信应用场景：
+根据团队的 `copilot-instructions` 规范，在此明确在使用 `GenericHandler` 或特定协议（如 `ModbusHandler`）时，针对不同通信应用场景的接口选择：
+
+| 场景 | 数据方向 | 推荐接口 | 不推荐接口 | 原因 |
+| --- | --- | --- | --- | --- |
+| 主动控制端 / 一问一答 | Push Request → Matched Response | `SendRequestAsync(...)` | `ReadParsedPacketsAsync(...)` | 需要超时、重试、匹配语义时，应直接复用 Handler 的请求响应能力。 |
+| 被动高频收集 / 主动上报 | Push Device Data → Pull by Stream | `ReadParsedPacketsAsync(...)` | `SendRequestAsync(...)` | 数据本身不是某次请求的响应，流式消费更自然且不会强耦合请求生命周期。 |
+| 仅发送命令，不等待匹配响应 | Push Only | `TryWrite(...)` | `Write(...)`（生产默认） | 生产建议优先结果语义，失败时走统一重试、退避和告警。 |
+| UI / 轻量通知 | Push Callback | `OnHandleChanged` | 在回调中直接长耗时处理 | 回调适合通知，不适合做重 IO、持久化或复杂聚合。 |
 
 - **主动式控制端 (主动派发 / Push via Request)**  
   建议使用带有明确超时重试功能的同步等待机制。  
@@ -31,7 +38,7 @@
   建议采用不会阻塞底层通道的流式读取机制。  
   **推荐 API:** `ReadParsedPacketsAsync(CancellationToken cancellationToken = default)` （返回 `IAsyncEnumerable<T>`）  
   **适用场景:** 设备主动上报状态数据（如连续高配比温度监测流或持续的测距传感器流）。业务层只需通过 `await foreach(var packet in handler.ReadParsedPacketsAsync(...))` 进行不停接收和归档即可，脱离请求/响应强绑定生命周期。  
-  *附注: 为了减缓极限通信下的堆内存压力，已针对 `ModbusPacket` 暴露了静态对象级缓存 `ModbusPacket.Rent()` 和 `ModbusPacket.Return(...)` 支持。在被动推流收集后若无长时间持久化必要，请通过 `Return` 还给池子。*
+  *附注：当前版本的 `ModbusPacket` 已是普通对象模型，不需要也不支持 `Rent/Return`。被动推流场景只需关注消费者吞吐和后续持久化策略。*
 
 ## 典型失败分支
 
@@ -98,7 +105,7 @@ modbusContext.OnHandleChanged += (sender, e) =>
 {
     var result = (OperateResult<ModbusPacket>)e;
     // UI 线程需调度
-    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Result));
+    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Content));
 };
 ```
 
@@ -115,7 +122,7 @@ protected override void OnParsed(ModbusPacket pkt)
 ```
 
 要点：
-- 若使用 `ReadParsedPacketsAsync`，请传入 `CancellationToken` 并确保消费者能跟上生产速率；否则可能触发通道丢包（默认是 DropOldest）。
+- 若使用 `ReadParsedPacketsAsync`，请传入 `CancellationToken` 并确保消费者能跟上生产速率；否则可能触发通道积压或丢包，具体行为取决于 `ResponseChannelFullMode` 配置。
 - `OnHandleChanged` 回调可能在解析线程触发；若在 UI 使用需切换线程上下文。
 - 不建议对每条报文执行 `_ = Task.Run(...)`；高吞吐长跑下容易造成任务堆积、线程池抖动和后续超时。
 
@@ -131,7 +138,7 @@ protected override void OnParsed(ModbusPacket pkt)
 #### 2. 半主动/订阅型连续采集（一次指令，连绵不断）
 * **代表设备**：需要上位机发送“开始测试”指令后，才以较高频率持续爆传数据的仪器。
 * **适用接口**：**非常适用**异步流 `ReadParsedPacketsAsync`。
-* **原因**：通过 `TryWrite` 发送单挑指令后，下机挂起一个 `await foreach` 的长期消费工作流接收连续测试结果，直到下发或者接收到“停止测试”信号（借由 `CancellationToken` 取消消费）。
+* **原因**：通过 `TryWrite` 发送单条指令后，下机挂起一个 `await foreach` 的长期消费工作流接收连续测试结果，直到下发或者接收到“停止测试”信号（借由 `CancellationToken` 取消消费）。
 
 #### 3. 传统主从“一问一答”（被动从站式主动轮询）
 * **代表设备**：标准 Modbus 从站（如各类温湿度计、常规PLC寄存器读写），完全遵守“不问不说”的应答纪律。
@@ -162,3 +169,8 @@ protected override void OnParsed(ModbusPacket pkt)
 ```csharp
 var options = configuration.GetSection("SerialPortService:GenericHandlerOptions").Get<GenericHandlerOptions>();
 var handler = new ModbusHandler("COM3", 9600, Parity.None, 8, StopBits.One, logger, options);
+```
+
+如果是**主动请求 / 一问一答**场景，优先使用 `SendRequestAsync(...)`；
+如果是**被动持续采集 / 高频上报**场景，优先使用 `ReadParsedPacketsAsync(...)`；
+如果只是**发送命令且不希望抛异常**，优先使用 `TryWrite(...)`。

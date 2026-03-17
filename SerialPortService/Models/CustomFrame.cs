@@ -5,6 +5,12 @@ namespace SerialPortService.Models
     /// </summary>
     public sealed class CustomFrame
     {
+        /// <summary>
+        /// 创建自定义协议帧对象。
+        /// </summary>
+        /// <param name="command">命令字</param>
+        /// <param name="payload">负载数据</param>
+        /// <param name="raw">原始完整帧</param>
         public CustomFrame(byte command, byte[] payload, byte[] raw)
         {
             Command = command;

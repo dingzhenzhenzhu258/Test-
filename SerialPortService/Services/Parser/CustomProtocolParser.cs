@@ -15,6 +15,9 @@ namespace SerialPortService.Services.Parser
         private const byte Tail = 0x55;
         private const int MaxLength = 64;
 
+        /// <summary>
+        /// 自定义协议帧解析状态。
+        /// </summary>
         private enum State
         {
             WaitHeader,
@@ -34,6 +37,9 @@ namespace SerialPortService.Services.Parser
         private readonly List<byte> _payload = new();
         private readonly List<byte> _raw = new();
 
+        /// <summary>
+        /// 逐字节尝试解析自定义协议帧。
+        /// </summary>
         public bool TryParse(byte b, [System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out CustomFrame result)
         {
             // 步骤1：默认置空解析结果。
@@ -107,6 +113,9 @@ namespace SerialPortService.Services.Parser
             return false;
         }
 
+        /// <summary>
+        /// 重置自定义协议状态机。
+        /// </summary>
         public void Reset()
         {
             // 步骤1：恢复状态机到初始状态。

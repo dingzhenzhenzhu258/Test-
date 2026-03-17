@@ -16,6 +16,9 @@ namespace SerialPortService.Services.Parser
 
         // 默认 Parse 方法会调用 TryParse，这里不需要重写 Parse
 
+        /// <summary>
+        /// 逐字节尝试解析扫码枪文本流。
+        /// </summary>
         public bool TryParse(byte b, out string result)
         {
             // 步骤2：将输入字节转为字符。
@@ -50,6 +53,9 @@ namespace SerialPortService.Services.Parser
             }
         }
 
+        /// <summary>
+        /// 重置扫码枪解析缓存。
+        /// </summary>
         public void Reset()
         {
             // 步骤1：清空内部缓存。

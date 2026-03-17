@@ -16,10 +16,24 @@ namespace SerialPortService.Services.Handler
         /// </summary>
         public const string MeterName = "SerialPortService.GenericHandler";
 
+        /// <summary>
+        /// 指标发布使用的 Meter 实例。
+        /// </summary>
         private static readonly Meter Meter = new(MeterName);
+
+        /// <summary>
+        /// 已注册的指标提供者弱引用表。
+        /// </summary>
         private static readonly ConcurrentDictionary<int, WeakReference<IGenericHandlerMetricsProvider>> Providers = new();
+
+        /// <summary>
+        /// 指标提供者自增注册 ID 种子。
+        /// </summary>
         private static int _providerIdSeed;
 
+        /// <summary>
+        /// 初始化所有 ObservableGauge 指标。
+        /// </summary>
         static GenericHandlerMetricsPublisher()
         {
             Meter.CreateObservableGauge<long>("serialport.handler.idle_dropped", ObserveIdleDropped);
@@ -37,6 +51,7 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 注册一个指标提供者实例。
         /// </summary>
+        /// <param name="provider">指标提供者</param>
         /// <returns>注册 ID，用于后续显式注销</returns>
         public static int Register(IGenericHandlerMetricsProvider provider)
         {
@@ -56,6 +71,7 @@ namespace SerialPortService.Services.Handler
         /// 显式注销指标提供者。
         /// 建议在处理器释放路径调用，避免仅依赖 GC 回收。
         /// </summary>
+        /// <param name="registrationId">注册 ID</param>
         public static void Unregister(int registrationId)
         {
             // 步骤1：按注册 ID 清理提供者。
@@ -64,17 +80,61 @@ namespace SerialPortService.Services.Handler
             Providers.TryRemove(registrationId, out _);
         }
 
+        /// <summary>
+        /// 采样空闲丢弃计数。
+        /// </summary>
         private static List<Measurement<long>> ObserveIdleDropped() => ObserveLong(m => m.IdleDropped);
+
+        /// <summary>
+        /// 采样通道溢出丢弃计数。
+        /// </summary>
         private static List<Measurement<long>> ObserveOverflowDropped() => ObserveLong(m => m.OverflowDropped);
+
+        /// <summary>
+        /// 采样未匹配响应计数。
+        /// </summary>
         private static List<Measurement<long>> ObserveUnmatched() => ObserveLong(m => m.Unmatched);
+
+        /// <summary>
+        /// 采样重试次数。
+        /// </summary>
         private static List<Measurement<long>> ObserveRetryCount() => ObserveLong(m => m.RetryCount);
+
+        /// <summary>
+        /// 采样超时次数。
+        /// </summary>
         private static List<Measurement<long>> ObserveTimeoutCount() => ObserveLong(m => m.TimeoutCount);
+
+        /// <summary>
+        /// 采样匹配成功次数。
+        /// </summary>
         private static List<Measurement<long>> ObserveMatchedCount() => ObserveLong(m => m.MatchedCount);
+
+        /// <summary>
+        /// 采样平均延迟。
+        /// </summary>
         private static List<Measurement<double>> ObserveAvgLatency() => ObserveDouble(m => m.AverageLatencyMs);
+
+        /// <summary>
+        /// 采样当前活跃请求数。
+        /// </summary>
         private static List<Measurement<int>> ObserveActiveRequests() => ObserveInt(m => m.ActiveRequests);
+
+        /// <summary>
+        /// 采样等待积压长度。
+        /// </summary>
         private static List<Measurement<long>> ObserveWaitBacklog() => ObserveLong(m => m.WaitBacklog);
+
+        /// <summary>
+        /// 采样等待积压高水位。
+        /// </summary>
         private static List<Measurement<long>> ObserveWaitBacklogHighWatermark() => ObserveLong(m => m.WaitBacklogHighWatermark);
 
+        /// <summary>
+        /// 采样长整型指标并附加标签。
+        /// </summary>
+        /// <param name="selector">指标选择器</param>
+        /// <returns>指标测量集合</returns>
         private static List<Measurement<long>> ObserveLong(Func<GenericHandlerMetrics, long> selector)
         {
             var measurements = new List<Measurement<long>>();
@@ -98,6 +158,11 @@ namespace SerialPortService.Services.Handler
             return measurements;
         }
 
+        /// <summary>
+        /// 采样双精度指标并附加标签。
+        /// </summary>
+        /// <param name="selector">指标选择器</param>
+        /// <returns>指标测量集合</returns>
         private static List<Measurement<double>> ObserveDouble(Func<GenericHandlerMetrics, double> selector)
         {
             var measurements = new List<Measurement<double>>();
@@ -121,6 +186,11 @@ namespace SerialPortService.Services.Handler
             return measurements;
         }
 
+        /// <summary>
+        /// 采样整型指标并附加标签。
+        /// </summary>
+        /// <param name="selector">指标选择器</param>
+        /// <returns>指标测量集合</returns>
         private static List<Measurement<int>> ObserveInt(Func<GenericHandlerMetrics, int> selector)
         {
             var measurements = new List<Measurement<int>>();
@@ -147,6 +217,8 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 构建指标标签。
         /// </summary>
+        /// <param name="provider">指标提供者</param>
+        /// <returns>用于上报的标签集合</returns>
         private static KeyValuePair<string, object?>[] CreateTags(IGenericHandlerMetricsProvider provider)
             =>
             [

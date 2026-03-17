@@ -75,7 +75,7 @@ var result = service.OpenPort("COM3", 9600, Parity.None, 8, StopBits.One, Handle
 
 - 所有项目统一通过你自定义 `Logger` 库写日志。
 - 每个应用都从 `appsettings.json` 读取 `GenericHandlerOptions` 后注入。
-- 上线后优先关注：`timeout_rate`、`overflow_dropped_rate`。
+- 上线后优先关注：`serialport.handler.timeout_count`、`serialport.handler.wait_backlog`，以及 `Reconnect failure-rate alert` 日志。
 
 ---
 
@@ -85,6 +85,22 @@ var result = service.OpenPort("COM3", 9600, Parity.None, 8, StopBits.One, Handle
 - `TryWrite(portName, data)`：结果语义。失败时返回 `OperateResult<byte[]>`，不抛异常。
 
 生产场景建议优先使用 `TryWrite`，并将失败分支接入统一重试与告警。
+
+## 场景与接口选择
+
+| 场景 | 通信模式 | 推荐接口 | 说明 |
+| --- | --- | --- | --- |
+| 主动控制 / 一问一答 | Push Request → Matched Response | `SendRequestAsync(...)` | 适合标准 Modbus 主从轮询、显式读写寄存器、控制类命令。 |
+| 被动持续采集 | Push Device Data → Pull by Stream | `ReadParsedPacketsAsync(...)` | 适合设备主动上报、连续测量流、扫码流。业务层使用 `await foreach` 持续消费。 |
+| 仅发送、不关心匹配响应 | Push Only | `TryWrite(...)` | 适合告警灯、简单触发命令、业务自行处理失败重试。 |
+| UI / 轻量通知 | Push Callback | `OnHandleChanged` | 适合页面刷新、轻量提示；不适合高吞吐重处理。 |
+
+选择原则：
+
+- **需要“请求-响应匹配、超时、重试”**：优先选 `SendRequestAsync`。
+- **设备自己持续上报数据**：优先选 `ReadParsedPacketsAsync`。
+- **只想发命令，失败不抛异常**：优先选 `TryWrite`。
+- **只做简单通知**：可用 `OnHandleChanged`，但不要在回调里做重 IO 或长耗时逻辑。
 
 ---
 
@@ -137,7 +153,7 @@ _ = Task.Run(async () =>
 modbusContext.OnHandleChanged += (sender, e) =>
 {
     var result = (OperateResult<ModbusPacket>)e;
-    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Result));
+    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Content));
 };
 ```
 

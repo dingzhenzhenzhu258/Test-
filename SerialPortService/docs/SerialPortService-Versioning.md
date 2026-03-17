@@ -75,3 +75,38 @@
 2. 生产业务优先迁移到 `TryWrite`，保留 `Write` 仅用于需要异常中断的路径
 3. 同步更新配置项（`GenericHandlerOptions` 中告警阈值）
 4. 若直接实现 `ISerialPortService`，补充 `TryWrite` 实现
+
+---
+
+## 升级检查清单
+
+升级前后建议至少检查以下项目：
+
+1. `using` 命名空间是否已从 `Models.Emuns` 全部替换到 `Models.Enums`
+2. 是否存在直接实现 `ISerialPortService` 的自定义服务
+3. 生产配置中的 `GenericHandlerOptions` 是否已补齐重连与告警阈值
+4. 业务发送路径是否应从 `Write` 迁移到 `TryWrite`
+5. 监控系统是否已接入 `SerialPortService.GenericHandler` 这个 `Meter`
+6. 看板和告警是否已按 `port` / `deviceType` / `protocol` 标签拆分
+
+---
+
+## 按场景评估升级影响
+
+### 1) 主动请求 / 一问一答
+
+- 重点检查 `SendRequestAsync(...)` 调用链是否仍按原有超时与重试策略运行。
+- 升级后建议重点观察：`timeout_count`、`retry_count`、`avg_latency_ms`。
+- 若原来业务依赖“发送失败即抛异常”，可继续保留 `Write`；否则建议迁移到 `TryWrite`。
+
+### 2) 被动持续采集 / 高频上报
+
+- 重点检查消费者是否能跟上 `ReadParsedPacketsAsync(...)` 的产出速率。
+- 升级后建议重点观察：`wait_backlog`、`wait_backlog_high_watermark`、`overflow_dropped`。
+- 若现场是高吞吐链路，务必确认 `ResponseChannelFullMode`、容量与持久化 worker 配置匹配。
+
+### 3) 仅发送命令 / 不关心匹配响应
+
+- 重点检查业务方是否已经统一走 `TryWrite` 结果语义。
+- 升级后建议重点观察发送失败分支、重连行为和失败日志是否接入告警。
+- 若仍保留 `Write`，需确认调用方已经完整捕获异常并具备补偿逻辑。
