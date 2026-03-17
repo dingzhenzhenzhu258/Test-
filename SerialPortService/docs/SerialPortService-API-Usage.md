@@ -48,8 +48,23 @@
 
 ## OpenPort 约束说明
 
-- 同一个串口名重复 `OpenPort` 时，若关键参数不一致（波特率、校验位、数据位、停止位、协议/解析器），库会返回失败。
-- 建议流程：`ClosePort` 后再按新参数重新 `OpenPort`。
+- 同一个串口名重复 `OpenPort` / `OpenPortAsync` 时，若关键参数不一致（波特率、校验位、数据位、停止位、协议/解析器），库会返回失败。
+- 建议流程：`ClosePortAsync` 后再按新参数重新 `OpenPortAsync`。
+
+## 打开 / 关闭接口
+
+### 同步版本（向后兼容）
+
+- `OpenPort(...)` / `OpenPort<T>(...)`：内部通过 `Task.Run` 避免 UI 线程死锁，但仍会阻塞调用线程。
+- `CloseAll()`：同步关闭全部端口，每端口 3s 超时保护。
+
+### 异步版本（推荐）
+
+- `OpenPortAsync(...)` / `OpenPortAsync<T>(...)`：真正异步打开，不阻塞调用线程，锁外 `await` 不会长时间持锁。
+- `CloseAllAsync()`：异步关闭全部端口，每端口 3s 超时保护。
+- `ClosePortAsync(portName)`：异步关闭单个端口（3s 超时保护）。
+
+新代码建议统一使用 Async 版本。
 
 ## 推荐异常处理模板
 
@@ -169,6 +184,16 @@ protected override void OnParsed(ModbusPacket pkt)
 ```csharp
 var options = configuration.GetSection("SerialPortService:GenericHandlerOptions").Get<GenericHandlerOptions>();
 var handler = new ModbusHandler("COM3", 9600, Parity.None, 8, StopBits.One, logger, options);
+```
+
+使用 DI 方式异步打开端口：
+
+```csharp
+// 推荐：异步打开
+var result = await serialPortService.OpenPortAsync("COM3", 9600, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
+
+// 关闭时推荐：
+var closeResult = await serialPortService.CloseAllAsync();
 ```
 
 如果是**主动请求 / 一问一答**场景，优先使用 `SendRequestAsync(...)`；

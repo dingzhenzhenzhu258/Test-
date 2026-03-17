@@ -20,6 +20,12 @@ namespace SerialPortService.Services.Interfaces
         void Open();
 
         /// <summary>
+        /// 异步打开串口并启动处理流水线。
+        /// 推荐在非 UI 线程或 async 上下文中使用，避免 sync-over-async 阻塞。
+        /// </summary>
+        Task OpenAsync();
+
+        /// <summary>
         /// 关闭串口并停止处理流水线。
         /// </summary>
         void Close();

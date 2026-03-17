@@ -252,6 +252,8 @@ public class SerialPortServiceProductionReadinessTests
 
         public void Open() => _opened = true;
 
+        public Task OpenAsync() { _opened = true; return Task.CompletedTask; }
+
         public void Close()
         {
             _opened = false;

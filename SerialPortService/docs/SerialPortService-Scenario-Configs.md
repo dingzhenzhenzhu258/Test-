@@ -169,8 +169,11 @@ public class MyDeviceParser : IStreamParser<MyFrame>
     public bool TryParse(byte b, out MyFrame? result) { ... }
     public void Reset() { ... }
 }
-// 注册并打开
-var result = service.OpenPort("COM5", 115200, Parity.None, 8, StopBits.One, new MyDeviceParser());
+// 推荐：异步打开
+var result = await service.OpenPortAsync("COM5", 115200, Parity.None, 8, StopBits.One, new MyDeviceParser());
+
+// 向后兼容：同步打开
+// var result = service.OpenPort("COM5", 115200, Parity.None, 8, StopBits.One, new MyDeviceParser());
 ```
 
 ```json

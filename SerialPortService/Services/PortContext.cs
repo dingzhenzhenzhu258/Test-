@@ -256,9 +256,9 @@ namespace SerialPortService.Services
         }
 
         /// <summary>
-        /// 打开串口并启动处理引擎
+        /// 异步打开串口并启动处理引擎（推荐）。
         /// </summary>
-        public void Open()
+        public async Task OpenAsync()
         {
             // 步骤1：幂等保护，避免重复启动管线。
             // 为什么：重复启动会创建多组读写任务导致竞争。
@@ -266,22 +266,36 @@ namespace SerialPortService.Services
             if (_isRunning) return;
             Interlocked.Exchange(ref _closeSignaled, 0);
 
-            // 步骤1.1：异步重试打开串口，通过 Task.Run 避免在有 SynchronizationContext 的线程上死锁。
-            // 为什么：Thread.Sleep 在 UI 线程上会冻结界面，而 .GetAwaiter().GetResult() 在有 SyncCtx 时会死锁。
-            // 风险点：Task.Run 切换到线程池执行，调用方需接受短暂的线程切换开销。
-            Task.Run(() => EnsurePortOpenedWithRetryAsync()).GetAwaiter().GetResult();
+            // 步骤2：异步重试打开串口，真正 await 而非阻塞线程。
+            // 为什么：避免在有 SynchronizationContext 的线程上死锁。
+            // 风险点：调用方需确保不在持锁上下文中 await。
+            await EnsurePortOpenedWithRetryAsync().ConfigureAwait(false);
 
             _isRunning = true;
             _cts = new CancellationTokenSource();
             _sendChannel = CreateSendChannel();
             _rawInputChannel = CreateRawInputChannel();
 
-            // 步骤2：按"读-解析-发送"顺序启动后台任务。
+            // 步骤3：按"读-解析-发送"顺序启动后台任务。
             // 为什么：拆分职责便于背压控制与性能观测。
             // 风险点：任一任务未启动会造成数据链路断裂。
             StartPipelineTasks(_cts.Token);
 
             Logger.AddLog(LogLevel.Information, $"[{Name}] Pipeline 引擎已启动");
+        }
+
+        /// <summary>
+        /// 同步打开串口并启动处理引擎（向后兼容）。
+        /// 内部通过 <see cref="Task.Run"/> 委托到线程池避免 SynchronizationContext 死锁。
+        /// 新代码建议优先使用 <see cref="OpenAsync"/>。
+        /// </summary>
+        public void Open()
+        {
+            if (_isRunning) return;
+            // 步骤1：通过 Task.Run 跳过 SynchronizationContext 再同步等待。
+            // 为什么：WPF/WinForms UI 线程有 SyncContext，直接 .GetAwaiter().GetResult() 会死锁。
+            // 风险点：新代码建议直接使用 OpenAsync()，此方法仅保留向后兼容。
+            Task.Run(() => OpenAsync()).GetAwaiter().GetResult();
         }
 
         /// <summary>

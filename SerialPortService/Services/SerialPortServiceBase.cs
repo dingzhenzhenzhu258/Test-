@@ -208,6 +208,121 @@ namespace SerialPortService.Services
         }
 
         /// <summary>
+        /// 异步打开串口（使用预定义设备枚举）。
+        /// 推荐在非 UI 线程或 async 上下文中使用，避免 sync-over-async 阻塞。
+        /// </summary>
+        public async Task<OperateResult> OpenPortAsync(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, HandleEnum handleEnum = HandleEnum.Default, ProtocolEnum protocol = ProtocolEnum.Default)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(portName))
+                    return new OperateResult(false, "串口名不能为空", -1);
+
+                var resolvedProtocol = protocol;
+                IPortContext context;
+
+                lock (portOpenCloseLock)
+                {
+                    // 步骤1：校验端口重开参数一致性（同 OpenPort）。
+                    // 为什么：同端口复用旧上下文时必须保证参数一致。
+                    // 风险点：参数漂移会造成"看似成功打开，实际用旧参数通信"。
+                    if (portBindings.TryGetValue(portName, out var existingBinding))
+                    {
+                        var requestedProtocol = protocol == ProtocolEnum.Default ? existingBinding.Protocol : protocol;
+                        var requestedBinding = new PortBinding(baudRate, parity, dataBits, stopBits, handleEnum, requestedProtocol, ParserType: null);
+                        if (existingBinding != requestedBinding)
+                        {
+                            return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
+                        }
+                    }
+
+                    // 步骤2：创建或复用端口上下文。
+                    // 为什么：在并发打开场景避免重复实例化上下文。
+                    // 风险点：若无原子复用，可能出现多上下文竞争同一串口。
+                    context = ports.GetOrAdd(portName, _ =>
+                    {
+                        var result = _contextFactory.Create(portName, baudRate, parity, dataBits, stopBits, handleEnum, protocol);
+                        resolvedProtocol = result.ResolvedProtocol;
+                        return result.Context;
+                    });
+
+                    // 步骤3：双检绑定一致性并写入绑定快照。
+                    // 为什么：防止并发路径造成"上下文与绑定参数不一致"。
+                    // 风险点：绑定状态错误会影响后续重开校验与排障。
+                    var binding = new PortBinding(baudRate, parity, dataBits, stopBits, handleEnum, resolvedProtocol, ParserType: null);
+                    if (portBindings.TryGetValue(portName, out var currentBinding) && currentBinding != binding)
+                    {
+                        return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
+                    }
+                    portBindings.TryAdd(portName, binding);
+                }
+
+                // 步骤4：在锁外异步打开上下文，避免长时间持锁。
+                // 为什么：Open 内含重试等待，持锁期间会阻塞所有 OpenPort/ClosePort 请求。
+                // 风险点：锁外打开存在极短窗口期，但 OpenAsync 内部有幂等保护。
+                await context.OpenAsync().ConfigureAwait(false);
+
+                string info = $"串口 {portName} 打开成功，模式：{handleEnum} / {resolvedProtocol}，参数：波特率={baudRate}, 数据位={dataBits}, 校验位={parity}, 停止位={stopBits}";
+                return new OperateResult(true, info, 0);
+            }
+            catch (Exception e)
+            {
+                return new OperateResult(false, $"串口打开失败：{e.Message}", -1);
+            }
+        }
+
+        /// <summary>
+        /// 异步打开串口（使用自定义解析器）。
+        /// </summary>
+        public async Task<OperateResult> OpenPortAsync<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, IStreamParser<T> parser) where T : class
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(portName))
+                    return new OperateResult(false, "串口名不能为空", -1);
+
+                ArgumentNullException.ThrowIfNull(parser);
+
+                IPortContext context;
+
+                lock (portOpenCloseLock)
+                {
+                    // 步骤1：将解析器类型纳入绑定一致性校验。
+                    // 为什么：同端口不同解析器本质上是不同协议语义。
+                    // 风险点：若忽略解析器类型，可能把旧解析器误用于新协议数据流。
+                    var parserType = parser.GetType().FullName;
+                    var expected = new PortBinding(baudRate, parity, dataBits, stopBits, HandleEnum.Default, ProtocolEnum.Default, parserType);
+                    if (portBindings.TryGetValue(portName, out var existingBinding) && existingBinding != expected)
+                    {
+                        return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
+                    }
+
+                    // 步骤2：创建或复用 GenericHandler<T>。
+                    // 为什么：复用通用并发、重试、告警和指标能力。
+                    // 风险点：若复用了错误上下文，会导致解析错位或请求匹配失败。
+                    context = ports.GetOrAdd(portName, _ => new GenericHandler<T>(portName, baudRate, parity, dataBits, stopBits, parser, _loggerFactory.CreateLogger<GenericHandler<T>>(), _contextFactory.CreateTaggedOptions(HandleEnum.Default, ProtocolEnum.Default)));
+                    if (portBindings.TryGetValue(portName, out var currentBinding) && currentBinding != expected)
+                    {
+                        return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
+                    }
+                    portBindings.TryAdd(portName, expected);
+                }
+
+                // 步骤3：在锁外异步打开上下文。
+                // 为什么：避免长时间持锁阻塞其他端口操作。
+                // 风险点：锁外打开存在极短窗口期，但 OpenAsync 内部有幂等保护。
+                await context.OpenAsync().ConfigureAwait(false);
+
+                string info = $"串口 {portName} 打开成功 (自定义解析器)，参数：波特率={baudRate}, 数据位={dataBits}, 校验位={parity}, 停止位={stopBits}";
+                return new OperateResult(true, info, 0);
+            }
+            catch (Exception e)
+            {
+                return new OperateResult(false, $"串口打开失败：{e.Message}", -1);
+            }
+        }
+
+        /// <summary>
         /// 写对应串口数据
         /// </summary>
         /// <param name="portName"></param>
@@ -391,10 +506,100 @@ namespace SerialPortService.Services
             var errors = new List<string>();
             foreach (var (portName, context) in contextsToClose)
             {
+                // 步骤3：每个端口限时 3s 关闭，防止单口驱动死锁卡住整个关闭序列。
+                // 为什么：与 ClosePortAsync 保持一致的超时兜底策略。
+                // 风险点：超时后句柄可能残留，但避免了进程级阻塞。
                 try
                 {
-                    context.Close();
-                    context.Dispose();
+                    var completed = Task.Run(() =>
+                    {
+                        context.Close();
+                        context.Dispose();
+                    }).Wait(3000);
+
+                    if (!completed)
+                    {
+                        errors.Add($"{portName}: 驱动响应超时，已强制放弃");
+                        _logger.AddLog(
+                            level: LogLevel.Warning,
+                            messageTemplate: "CloseAll: 串口 {PortName} 关闭超时（3s），已强制跳过",
+                            isShowUI: false,
+                            args: portName);
+                    }
+                }
+                catch (AggregateException aex)
+                {
+                    errors.Add($"{portName}:{aex.InnerException?.Message ?? aex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{portName}:{ex.Message}");
+                }
+            }
+
+            if (errors.Count > 0)
+                return new OperateResult(false, $"部分关闭失败: {string.Join("; ", errors)}", -1);
+
+            return new OperateResult(true, $"关闭完成: {contextsToClose.Count}", 0);
+        }
+
+        /// <summary>
+        /// 异步关闭全部已打开串口，每个端口限时 3s 防止驱动死锁。
+        /// </summary>
+        public async Task<OperateResult> CloseAllAsync()
+        {
+            List<(string PortName, IPortContext Context)> contextsToClose;
+            lock (portOpenCloseLock)
+            {
+                // 步骤1：快照当前端口并原子摘除。
+                // 为什么：避免遍历期间字典变化影响关闭流程。
+                // 风险点：并发修改时若无快照，可能遗漏或重复关闭。
+                var portNames = ports.Keys.ToList();
+                contextsToClose = new List<(string PortName, IPortContext Context)>(portNames.Count);
+
+                foreach (var portName in portNames)
+                {
+                    if (!ports.TryRemove(portName, out var ctx))
+                        continue;
+                    portBindings.TryRemove(portName, out _);
+                    contextsToClose.Add((portName, ctx));
+                }
+
+                if (contextsToClose.Count == 0)
+                    return new OperateResult(true, "关闭完成: 0", 0);
+            }
+
+            var errors = new List<string>();
+            foreach (var (portName, context) in contextsToClose)
+            {
+                // 步骤2：每个端口限时 3s 异步关闭。
+                // 为什么：与 ClosePortAsync 保持一致的超时兜底策略。
+                // 风险点：超时后句柄可能残留，但避免了进程级阻塞。
+                try
+                {
+                    var closeTask = Task.Run(() =>
+                    {
+                        context.Close();
+                        context.Dispose();
+                    });
+
+                    using var timeoutCts = new CancellationTokenSource();
+                    var delayTask = Task.Delay(3000, timeoutCts.Token);
+
+                    if (await Task.WhenAny(closeTask, delayTask).ConfigureAwait(false) != closeTask)
+                    {
+                        errors.Add($"{portName}: 驱动响应超时，已强制放弃");
+                        _logger.AddLog(
+                            level: LogLevel.Warning,
+                            messageTemplate: "CloseAllAsync: 串口 {PortName} 关闭超时（3s），已强制跳过",
+                            isShowUI: false,
+                            args: portName);
+                    }
+                    else
+                    {
+                        await timeoutCts.CancelAsync().ConfigureAwait(false);
+                        await closeTask.ConfigureAwait(false);
+                    }
                 }
                 catch (Exception ex)
                 {

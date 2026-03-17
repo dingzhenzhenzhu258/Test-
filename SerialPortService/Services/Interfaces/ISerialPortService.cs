@@ -3,10 +3,7 @@ using SerialPortService.Models.Enums;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.IO.Ports;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace SerialPortService.Services.Interfaces
@@ -58,6 +55,33 @@ namespace SerialPortService.Services.Interfaces
         OperateResult OpenPort<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, IStreamParser<T> parser) where T : class;
 
         /// <summary>
+        /// 异步打开串口（使用预定义设备类型和协议）。
+        /// 推荐在非 UI 线程或 async 上下文中使用，避免 sync-over-async 阻塞。
+        /// </summary>
+        /// <param name="portName">串口名称</param>
+        /// <param name="baudRate">波特率</param>
+        /// <param name="parity">校验位</param>
+        /// <param name="dataBits">数据位</param>
+        /// <param name="stopBits">停止位</param>
+        /// <param name="handleEnum">设备类型</param>
+        /// <param name="protocol">协议类型</param>
+        /// <returns>打开结果</returns>
+        Task<OperateResult> OpenPortAsync(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, HandleEnum handleEnum, ProtocolEnum protocol = ProtocolEnum.Default);
+
+        /// <summary>
+        /// 异步打开串口（使用自定义解析器）。
+        /// </summary>
+        /// <typeparam name="T">解析结果类型</typeparam>
+        /// <param name="portName">串口名称</param>
+        /// <param name="baudRate">波特率</param>
+        /// <param name="parity">校验位</param>
+        /// <param name="dataBits">数据位</param>
+        /// <param name="stopBits">停止位</param>
+        /// <param name="parser">自定义解析器实例</param>
+        /// <returns>打开结果</returns>
+        Task<OperateResult> OpenPortAsync<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, IStreamParser<T> parser) where T : class;
+
+        /// <summary>
         /// 关闭指定串口。
         /// </summary>
         /// <param name="portName">串口名称</param>
@@ -69,6 +93,12 @@ namespace SerialPortService.Services.Interfaces
         /// </summary>
         /// <returns>关闭结果</returns>
         OperateResult CloseAll();
+
+        /// <summary>
+        /// 异步关闭所有已打开串口（每个端口带超时保护）。
+        /// </summary>
+        /// <returns>关闭结果</returns>
+        Task<OperateResult> CloseAllAsync();
 
         /// <summary>
         /// 获取已打开串口对应上下文。

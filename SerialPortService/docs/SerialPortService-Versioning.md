@@ -51,6 +51,14 @@
 - 调整：`PortContext.Send(byte[])` 在端口未打开时显式抛 `InvalidOperationException`
 - 增强：内置三类告警（超时率、积压、重连失败率）
 
+### Async API 与超时保护（当前版本）
+
+- 新增：`IPortContext.OpenAsync()` — 异步打开串口，消除 sync-over-async
+- 新增：`ISerialPortService.OpenPortAsync(...)` — 两个重载（枚举版 + 自定义解析器版）
+- 新增：`ISerialPortService.CloseAllAsync()` — 异步关闭全部端口，每端口 3s 超时保护
+- 增强：`CloseAll()` 同步版本也加入了每端口 3s 超时保护，防止驱动死锁卡住整个关闭序列
+- 保留：`Open()` / `OpenPort()` / `CloseAll()` 同步版本完全向后兼容，新代码建议迁移到 Async 版本
+
 ---
 
 ## 兼容性说明
@@ -67,6 +75,13 @@
 - 若调用方直接实现了 `ISerialPortService`，需补齐 `TryWrite` 方法后再升级
 - 若仅通过 DI 使用 `SerialPortServiceBase`，可直接升级并按需迁移到 `TryWrite`
 
+### `IPortContext` / `ISerialPortService` 接口新增 Async 方法
+
+属于 **Minor** 级别兼容新增：
+- 若调用方直接实现了 `IPortContext`，需补齐 `OpenAsync()` 方法
+- 若调用方直接实现了 `ISerialPortService`，需补齐 `OpenPortAsync` (2 重载) 和 `CloseAllAsync` 方法
+- 若仅通过 DI 使用 `SerialPortServiceBase`，可直接升级并按需迁移到 Async 版本
+
 ---
 
 ## 升级建议
@@ -74,7 +89,9 @@
 1. 全局替换 `using SerialPortService.Models.Emuns` → `using SerialPortService.Models.Enums`
 2. 生产业务优先迁移到 `TryWrite`，保留 `Write` 仅用于需要异常中断的路径
 3. 同步更新配置项（`GenericHandlerOptions` 中告警阈值）
-4. 若直接实现 `ISerialPortService`，补充 `TryWrite` 实现
+4. 若直接实现 `ISerialPortService`，补充 `TryWrite`、`OpenPortAsync`（2 重载）、`CloseAllAsync` 实现
+5. 若直接实现 `IPortContext`，补充 `OpenAsync()` 实现
+6. 新代码统一使用 `OpenPortAsync` / `CloseAllAsync` 替代同步版本
 
 ---
 
@@ -83,11 +100,13 @@
 升级前后建议至少检查以下项目：
 
 1. `using` 命名空间是否已从 `Models.Emuns` 全部替换到 `Models.Enums`
-2. 是否存在直接实现 `ISerialPortService` 的自定义服务
-3. 生产配置中的 `GenericHandlerOptions` 是否已补齐重连与告警阈值
-4. 业务发送路径是否应从 `Write` 迁移到 `TryWrite`
-5. 监控系统是否已接入 `SerialPortService.GenericHandler` 这个 `Meter`
-6. 看板和告警是否已按 `port` / `deviceType` / `protocol` 标签拆分
+2. 是否存在直接实现 `ISerialPortService` 的自定义服务（需补齐 `TryWrite`、`OpenPortAsync`、`CloseAllAsync`）
+3. 是否存在直接实现 `IPortContext` 的自定义上下文（需补齐 `OpenAsync`）
+4. 生产配置中的 `GenericHandlerOptions` 是否已补齐重连与告警阈值
+5. 业务发送路径是否应从 `Write` 迁移到 `TryWrite`
+6. 业务打开/关闭路径是否应从 `OpenPort` / `CloseAll` 迁移到 `OpenPortAsync` / `CloseAllAsync`
+7. 监控系统是否已接入 `SerialPortService.GenericHandler` 这个 `Meter`
+8. 看板和告警是否已按 `port` / `deviceType` / `protocol` 标签拆分
 
 ---
 

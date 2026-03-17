@@ -66,7 +66,12 @@ var options = new GenericHandlerOptions
 };
 
 var service = new SerialPortServiceBase(loggerFactory, options);
-var result = service.OpenPort("COM3", 9600, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
+
+// 推荐：异步打开（避免 sync-over-async，不阻塞 UI 线程）
+var result = await service.OpenPortAsync("COM3", 9600, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
+
+// 向后兼容：同步打开（内部通过 Task.Run 跳过 SyncContext）
+// var result = service.OpenPort("COM3", 9600, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
 ```
 
 ---
@@ -85,6 +90,16 @@ var result = service.OpenPort("COM3", 9600, Parity.None, 8, StopBits.One, Handle
 - `TryWrite(portName, data)`：结果语义。失败时返回 `OperateResult<byte[]>`，不抛异常。
 
 生产场景建议优先使用 `TryWrite`，并将失败分支接入统一重试与告警。
+
+## 打开 / 关闭接口语义
+
+- `OpenPort(...)` / `OpenPort<T>(...)` ：同步打开（内部通过 `Task.Run` 避免 UI 线程死锁）。
+- `OpenPortAsync(...)` / `OpenPortAsync<T>(...)` ：**推荐**。真正异步打开，不阻塞调用线程。
+- `ClosePortAsync(portName)` ：异步关闭单个端口（3s 超时保护）。
+- `CloseAll()` ：同步关闭全部端口（每端口 3s 超时保护）。
+- `CloseAllAsync()` ：**推荐**。异步关闭全部端口（每端口 3s 超时保护）。
+
+新代码建议统一使用 Async 版本。
 
 ## 场景与接口选择
 
