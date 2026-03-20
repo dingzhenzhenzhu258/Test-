@@ -41,6 +41,7 @@ namespace Logger.Extensions
         private static readonly object otlpRecoveryTimerLock = new();
         private static readonly object otlpTelemetryRuntimeLock = new();
         private static int _otlpAvailableFlag = 1;
+        private static Action? _restartRecoveryMonitor;
 
         public static readonly ActivitySource TraceSource = new("Hardware.Tracer");
 
@@ -153,6 +154,13 @@ namespace Logger.Extensions
                 .AddAttributes(resourceAttributes);
 
             var loggerConfig = CreateLoggerConfiguration(configuration, resourceAttributes, credentials, otlpLogsEndpoint, otlpEnabled);
+
+            // 步骤1.5：保存恢复探测重启入口，供运行时 SelfLog 检测到二次断开时调用。
+            // 为什么：恢复后 Timer 已自毁，若再次断开需要能重新启动探测循环。
+            // 风险点：闭包捕获了 configuration 等引用，生命周期与进程一致。
+            _restartRecoveryMonitor = () => StartOtlpRecoveryMonitor(
+                configuration, credentials, resourceAttributes, projectName, isWebApi,
+                otlpLogsEndpoint, otlpTracesEndpoint, otlpMetricsEndpoint);
 
             if (!otlpEnabled)
             {
@@ -275,78 +283,96 @@ namespace Logger.Extensions
                 _otlpRecoveryTimer?.Dispose();
                 _otlpRecoveryTimer = new Timer(_ =>
                 {
-                    var recovered = IsEndpointReachable(otlpLogsEndpoint, timeoutMs)
-                        && IsEndpointReachable(otlpTracesEndpoint, timeoutMs)
-                        && IsEndpointReachable(otlpMetricsEndpoint, timeoutMs);
-                    if (!recovered)
+                    try
                     {
-                        return;
-                    }
-
-                    if (Interlocked.CompareExchange(ref _otlpRecoveryNotified, 1, 0) != 0)
-                    {
-                        return;
-                    }
-
-                    var applyForLogs = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForLogs") ?? true;
-                    var applyForTelemetry = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForTelemetry") ?? true;
-                    var telemetryRuntimeSwitch = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForTelemetryRuntimeSwitch") ?? false;
-
-                    string telemetryTip;
-                    if (applyForTelemetry && telemetryRuntimeSwitch)
-                    {
-                        var telemetryRebuilt = TryRebuildTelemetryRuntimeProviders(
-                            isWebApi,
-                            projectName,
-                            resourceAttributes,
-                            credentials,
-                            otlpTracesEndpoint,
-                            otlpMetricsEndpoint,
-                            out var telemetryError);
-
-                        telemetryTip = telemetryRebuilt
-                            ? "Tracing/Metrics 导出器已完成运行时热重建并恢复上报。"
-                            : $"Tracing/Metrics 运行时热重建失败：{telemetryError}";
-                    }
-                    else if (applyForTelemetry)
-                    {
-                        telemetryTip = "Tracing/Metrics 导出器已保持启用，端点恢复后会自动继续上报。";
-                    }
-                    else
-                    {
-                        telemetryTip = "Tracing/Metrics 未启用自动恢复，需重启应用后生效。";
-                    }
-
-                    if (applyForLogs)
-                    {
-                        try
+                        var recovered = IsEndpointReachable(otlpLogsEndpoint, timeoutMs)
+                            && IsEndpointReachable(otlpTracesEndpoint, timeoutMs)
+                            && IsEndpointReachable(otlpMetricsEndpoint, timeoutMs);
+                        if (!recovered)
                         {
-                            var newLogger = CreateLoggerConfiguration(configuration, resourceAttributes, credentials, otlpLogsEndpoint, enableOtlp: true)
-                                .CreateLogger();
-                            var oldLogger = Log.Logger;
-                            Log.Logger = newLogger;
-                            (oldLogger as IDisposable)?.Dispose();
-
-                            SetOtlpAvailability(true);
-                            ReplayQueuedLogsIfAny(configuration);
-
-                            WriteOtlpFallbackNotice($"检测到 OTLP 端点已恢复可用，日志导出已自动恢复。{telemetryTip}");
+                            return;
                         }
-                        catch (Exception ex)
+
+                        if (Interlocked.CompareExchange(ref _otlpRecoveryNotified, 1, 0) != 0)
                         {
-                            WriteOtlpFallbackNotice($"OTLP 日志导出热恢复失败：{ex.Message}");
+                            return;
+                        }
+
+                        var applyForLogs = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForLogs") ?? true;
+                        var applyForTelemetry = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForTelemetry") ?? true;
+                        var telemetryRuntimeSwitch = configuration.GetValue<bool?>("Logger:Otlp:AutoRecoverApplyForTelemetryRuntimeSwitch") ?? false;
+
+                        string telemetryTip;
+                        if (applyForTelemetry && telemetryRuntimeSwitch)
+                        {
+                            var telemetryRebuilt = TryRebuildTelemetryRuntimeProviders(
+                                isWebApi,
+                                projectName,
+                                resourceAttributes,
+                                credentials,
+                                otlpTracesEndpoint,
+                                otlpMetricsEndpoint,
+                                out var telemetryError);
+
+                            telemetryTip = telemetryRebuilt
+                                ? "Tracing/Metrics 导出器已完成运行时热重建并恢复上报。"
+                                : $"Tracing/Metrics 运行时热重建失败：{telemetryError}";
+                        }
+                        else if (applyForTelemetry)
+                        {
+                            telemetryTip = "Tracing/Metrics 导出器已保持启用，端点恢复后会自动继续上报。";
+                        }
+                        else
+                        {
+                            telemetryTip = "Tracing/Metrics 未启用自动恢复，需重启应用后生效。";
+                        }
+
+                        if (applyForLogs)
+                        {
+                            try
+                            {
+                                var newLogger = CreateLoggerConfiguration(configuration, resourceAttributes, credentials, otlpLogsEndpoint, enableOtlp: true)
+                                    .CreateLogger();
+                                var oldLogger = Log.Logger;
+                                Log.Logger = newLogger;
+                                (oldLogger as IDisposable)?.Dispose();
+
+                                SetOtlpAvailability(true);
+                                ReplayQueuedLogsIfAny(configuration);
+
+                                WriteOtlpFallbackNotice($"检测到 OTLP 端点已恢复可用，日志导出已自动恢复。{telemetryTip}");
+                            }
+                            catch (Exception ex)
+                            {
+                                WriteOtlpFallbackNotice($"OTLP 日志导出热恢复失败：{ex.Message}");
+                            }
+                        }
+                        else
+                        {
+                            var logTip = "日志导出未配置自动热恢复，需重启应用后生效。";
+                            WriteOtlpFallbackNotice($"检测到 OTLP 端点已恢复可用。{logTip}{telemetryTip}");
+                        }
+
+                        // 步骤4：重置故障标记，允许 SelfLog 再次检测未来的 OTLP 断开。
+                        // 为什么：_otlpAlertRaised=1 时 SelfLog 回调会直接跳过，无法感知二次故障。
+                        // 风险点：重置与 Timer 销毁之间的窗口期内 SelfLog 可能触发，
+                        //        但 StartOtlpRecoveryMonitor 内部有 lock 保护，不会竞态。
+                        Interlocked.Exchange(ref _otlpAlertRaised, 0);
+
+                        lock (otlpRecoveryTimerLock)
+                        {
+                            _otlpRecoveryTimer?.Dispose();
+                            _otlpRecoveryTimer = null;
                         }
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        var logTip = "日志导出未配置自动热恢复，需重启应用后生效。";
-                        WriteOtlpFallbackNotice($"检测到 OTLP 端点已恢复可用。{logTip}{telemetryTip}");
-                    }
-
-                    lock (otlpRecoveryTimerLock)
-                    {
-                        _otlpRecoveryTimer?.Dispose();
-                        _otlpRecoveryTimer = null;
+                        // 步骤5：顶层异常兜底，防止 Timer 回调崩溃导致恢复永久卡死。
+                        // 为什么：CAS 将 _otlpRecoveryNotified 置 1 后若抛异常，
+                        //        后续 tick 全部在 CAS 处 return，恢复逻辑永远无法执行。
+                        // 风险点：重置为 0 后下次 tick 会重试，不会无限循环（有 recovered 前置检查）。
+                        Interlocked.Exchange(ref _otlpRecoveryNotified, 0);
+                        WriteOtlpFallbackNotice($"恢复探测回调异常，将在下次探测周期重试: {ex.Message}");
                     }
                 }, null, intervalMs, intervalMs);
             }
@@ -598,7 +624,26 @@ namespace Logger.Extensions
             {
                 using var tcpClient = new TcpClient();
                 var connectTask = tcpClient.ConnectAsync(uri.Host, port);
-                return connectTask.Wait(timeoutMs) && tcpClient.Connected;
+
+                // 步骤1：带超时等待 TCP 连接结果。
+                // 为什么：阻塞式探测需要有限超时，否则端口不可达时会长时间挂起。
+                // 风险点：Wait 超时后 connectTask 仍在后台运行，using 释放 tcpClient
+                //        会导致 SocketException(995)，若不观察 Task 则会变成
+                //        UnobservedTaskException，被 WPF 全局异常处理器捕获。
+                if (connectTask.Wait(timeoutMs))
+                {
+                    return tcpClient.Connected;
+                }
+
+                // 步骤2：超时时主动观察悬挂 Task 的异常，避免 UnobservedTaskException。
+                // 为什么：using 释放 Socket 后后台 Task 会以 SocketException 终结，
+                //        不观察会在 GC 回收时由 finalizer 线程抛出。
+                // 风险点：ContinueWith 回调在线程池执行，开销极低。
+                connectTask.ContinueWith(
+                    static t => { _ = t.Exception; },
+                    TaskContinuationOptions.OnlyOnFaulted);
+
+                return false;
             }
             catch
             {
@@ -629,7 +674,8 @@ namespace Logger.Extensions
                 }
 
                 SetOtlpAvailability(false);
-                WriteOtlpFallbackNotice($"OTLP 导出异常。常规业务日志继续写入 app.log，fallback.log 仅记录 OTLP 失败/恢复提示与补传异常。原始消息: {message}");
+                _restartRecoveryMonitor?.Invoke();
+                WriteOtlpFallbackNotice($"OTLP 导出异常，已切换至离线队列并重启恢复探测。常规业务日志继续写入 app.log。原始消息: {message}");
             });
         }
 

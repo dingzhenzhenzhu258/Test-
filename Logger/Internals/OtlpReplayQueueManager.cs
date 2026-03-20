@@ -1,4 +1,6 @@
 using Serilog;
+using Serilog.Events;
+using Serilog.Parsing;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -20,6 +22,15 @@ namespace Logger.Internals
         private static string? _currentQueueFile;
         private static long _replayFailureCount;
         private static OverflowStrategy _overflowStrategy = OverflowStrategy.DropOldest;
+
+        // 步骤0：预编译补传消息模板，避免每条日志重复解析。
+        // 为什么：MessageTemplateParser.Parse 有正则开销，缓存后复用可提升吞吐。
+        // 风险点：模板占位符名称必须与 LogEventProperty 名称严格一致。
+        private static readonly MessageTemplateParser _templateParser = new();
+        private static readonly MessageTemplate _replayTemplate =
+            _templateParser.Parse("[Replay] {Message}");
+        private static readonly MessageTemplate _replayWithExTemplate =
+            _templateParser.Parse("[Replay] {Message} | Exception: {ReplayException}");
 
         // 默认配置
         private static long _maxFileSizeBytes = 50L * 1024 * 1024; // 50MB
@@ -349,18 +360,38 @@ namespace Logger.Internals
                         }
 
                         var level = ParseSerilogLevel(entry.Level);
-                        var replayLogger = Log.ForContext("ReplayQueue", true)
-                            .ForContext("ReplayTimestampUtc", entry.TimestampUtc);
 
+                        // 步骤1：将 DateTime 转为 DateTimeOffset，确保 Kind=Utc。
+                        // 为什么：JSON 反序列化后 Kind 可能为 Unspecified，直接构造 DateTimeOffset 会偏移到本地时区。
+                        // 风险点：Enqueue 端已保存 DateTime.UtcNow，这里强制 Utc 是安全的。
+                        var ts = entry.TimestampUtc.Kind == DateTimeKind.Utc
+                            ? entry.TimestampUtc
+                            : DateTime.SpecifyKind(entry.TimestampUtc, DateTimeKind.Utc);
+                        var timestamp = new DateTimeOffset(ts);
+
+                        var properties = new List<LogEventProperty>
+                        {
+                            new("ReplayQueue", new ScalarValue(true)),
+                            new("ReplayTimestampUtc", new ScalarValue(entry.TimestampUtc)),
+                            new("Message", new ScalarValue(entry.Message))
+                        };
+
+                        MessageTemplate template;
                         if (!string.IsNullOrWhiteSpace(entry.Exception))
                         {
-                            replayLogger = replayLogger.ForContext("ReplayException", entry.Exception);
-                            replayLogger.Write(level, "[Replay] {Message} | Exception: {ReplayException}", entry.Message, entry.Exception);
+                            properties.Add(new LogEventProperty("ReplayException", new ScalarValue(entry.Exception)));
+                            template = _replayWithExTemplate;
                         }
                         else
                         {
-                            replayLogger.Write(level, "[Replay] {Message}", entry.Message);
+                            template = _replayTemplate;
                         }
+
+                        // 步骤2：用原始时间戳构造 LogEvent，OTLP Sink 按此时间导出。
+                        // 为什么：Log.Write(level, template, args) 总是使用 DateTimeOffset.Now，补传日志会全部堆叠到当前时刻。
+                        // 风险点：MessageTemplate 占位符必须与 properties 名称一一对应，否则渲染为空。
+                        var logEvent = new LogEvent(timestamp, level, null, template, properties);
+                        Log.Write(logEvent);
 
                         replayed++;
                         if (replayed >= maxBatch)
@@ -382,11 +413,11 @@ namespace Logger.Internals
             return (replayed, failed);
         }
 
-        private static Serilog.Events.LogEventLevel ParseSerilogLevel(string? level)
+        private static LogEventLevel ParseSerilogLevel(string? level)
         {
-            return Enum.TryParse<Serilog.Events.LogEventLevel>(level, true, out var parsed)
+            return Enum.TryParse<LogEventLevel>(level, true, out var parsed)
                 ? parsed
-                : Serilog.Events.LogEventLevel.Information;
+                : LogEventLevel.Information;
         }
 
         private static void LogFallbackNotice(string message)

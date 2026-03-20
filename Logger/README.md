@@ -148,6 +148,7 @@ app.SubscribeGlobalExceptions(logger);
   - 检查 `AutoRecoverApplyForLogs`；
   - 检查认证头与端点地址；
   - 检查网络与端口连通性。
+- 补传日志时间戳：补传事件使用**原始产生时间**（`entry.TimestampUtc`），而非补传执行时间。在 OpenObserve 中搜索 `ReplayQueue=true` 可定位所有补传日志。
 
 ---
 
