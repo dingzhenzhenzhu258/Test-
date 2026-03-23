@@ -1,9 +1,11 @@
 ﻿using SerialPortService.Models;
 using SerialPortService.Services.Interfaces;
+using SerialPortService.Services.Handler;
 using Logger.Helpers;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO.Ports;
 using System.Threading;
 using System.Threading.Channels;
@@ -22,13 +24,8 @@ namespace SerialPortService.Services
     /// 子类仅需提供解析器，并可通过 <see cref="OnParsed(T)"/> 扩展处理逻辑。
     /// Pipeline 循环实现见 PortContext.Pipeline.cs，重连逻辑见 PortContext.Reconnect.cs。
     /// </summary>
-    public abstract partial class PortContext<T> : IPortContext where T : class
+    public abstract partial class PortContext<T> : IPortContext, IPortRuntimeDiagnostics where T : class
     {
-        // 步骤1：控制是否输出每次原始读块日志。
-        // 为什么：便于在排查串口分包、粘包、吞包问题时观察底层读取行为。
-        // 风险点：开启后高频串口场景会产生大量日志，可能影响性能并放大磁盘占用。
-        private const bool EnableRawReadChunkLog = true;
-
         // 步骤2：定义串口打开失败时的最大重试次数。
         // 为什么：部分驱动或系统句柄释放存在短暂延迟，重试可提升重新打开成功率。
         // 风险点：次数过大时，最终失败前的等待时间会变长，影响调用方响应速度。
@@ -43,6 +40,7 @@ namespace SerialPortService.Services
         /// 日志记录器
         /// </summary>
         protected readonly ILogger Logger;
+        protected readonly GenericHandlerOptions RuntimeOptions;
 
         /// <summary>
         /// 内存块包装器，用于在 Channel 中传递借来的数组
@@ -78,6 +76,7 @@ namespace SerialPortService.Services
 
         // 原始数据缓冲通道 (生产者-消费者 模型)
         private Channel<RentedBuffer> _rawInputChannel;
+        private Channel<object>? _parsedEventChannel;
         #endregion
 
         #region 任务
@@ -85,6 +84,7 @@ namespace SerialPortService.Services
         private Task? _parseTask;
         private Task? _sendTask;
         private Task? _rawBytesLoggerTask;
+        private Task? _parsedEventDispatchTask;
         #endregion
 
         /// <summary>
@@ -103,6 +103,13 @@ namespace SerialPortService.Services
         private volatile bool _isRunning = false;
         private long _reconnectCycleCount;
         private long _reconnectExhaustedCount;
+        private long _parsedEventDropCount;
+        private long _lastReconnectUtcTicks;
+        private string? _lastReconnectReason;
+        private long _lastCloseDurationMs;
+        private int _closeState;
+        private readonly RingBuffer<PortDiagnosticEvent> _recentEvents = new(64);
+        private readonly RingBuffer<PortDiagnosticEvent> _recentErrors = new(64);
 
         public string Name => _port.PortName;
         public bool LastCloseSucceeded => _lastCloseSucceeded;
@@ -118,21 +125,23 @@ namespace SerialPortService.Services
 
         protected abstract IStreamParser<T> Parser { get; }
 
-        public PortContext(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
+        public PortContext(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger, GenericHandlerOptions? options = null)
         {
             Logger = logger;
+            RuntimeOptions = options ?? new GenericHandlerOptions();
             _port = new System.IO.Ports.SerialPort(portName, baudRate, parity, dataBits, stopBits)
             {
-                ReadBufferSize = 1024 * 1024,
+                ReadBufferSize = RuntimeOptions.SerialPortReadBufferSize,
                 ReadTimeout = System.IO.Ports.SerialPort.InfiniteTimeout,
             };
             _sendChannel = CreateSendChannel();
             _rawInputChannel = CreateRawInputChannel();
+            _parsedEventChannel = CreateParsedEventChannel();
         }
 
-        private static Channel<DataPacket> CreateSendChannel()
+        private Channel<DataPacket> CreateSendChannel()
         {
-            return Channel.CreateBounded<DataPacket>(new BoundedChannelOptions(512)
+            return Channel.CreateBounded<DataPacket>(new BoundedChannelOptions(RuntimeOptions.SendChannelCapacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = true,
@@ -140,14 +149,41 @@ namespace SerialPortService.Services
             });
         }
 
-        private static Channel<RentedBuffer> CreateRawInputChannel()
+        private Channel<RentedBuffer> CreateRawInputChannel()
         {
-            return Channel.CreateBounded<RentedBuffer>(new BoundedChannelOptions(500)
+            return Channel.CreateBounded<RentedBuffer>(new BoundedChannelOptions(RuntimeOptions.RawInputChannelCapacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
                 SingleReader = true,
                 SingleWriter = true
             });
+        }
+
+        private Channel<object>? CreateParsedEventChannel()
+        {
+            if (!RuntimeOptions.DispatchParsedEventAsync)
+            {
+                return null;
+            }
+
+            return Channel.CreateBounded<object>(new BoundedChannelOptions(RuntimeOptions.ParsedEventChannelCapacity)
+            {
+                FullMode = RuntimeOptions.ParsedEventChannelFullMode,
+                SingleReader = true,
+                SingleWriter = true
+            });
+        }
+
+        protected void RecordDiagnosticEvent(string category, string message)
+        {
+            _recentEvents.Add(new PortDiagnosticEvent(DateTime.UtcNow.Ticks, category, message));
+        }
+
+        protected void RecordDiagnosticError(string category, string message)
+        {
+            var evt = new PortDiagnosticEvent(DateTime.UtcNow.Ticks, category, message);
+            _recentEvents.Add(evt);
+            _recentErrors.Add(evt);
         }
 
         private async Task EnsurePortOpenedWithRetryAsync()
@@ -191,6 +227,10 @@ namespace SerialPortService.Services
             _parseTask = Task.Run(() => ParseLoop(token));
             _sendTask = Task.Run(() => SendLoop(token));
             _rawBytesLoggerTask = Task.Run(() => RawBytesLoggerLoop(token));
+            if (_parsedEventChannel != null)
+            {
+                _parsedEventDispatchTask = Task.Run(() => ParsedEventDispatchLoopAsync(token));
+            }
         }
 
         private void StopAndCompleteChannels()
@@ -199,6 +239,7 @@ namespace SerialPortService.Services
             _cts?.Cancel();
             _sendChannel.Writer.TryComplete();
             _rawInputChannel.Writer.TryComplete();
+            _parsedEventChannel?.Writer.TryComplete();
         }
 
         private void TryCloseSerialPort()
@@ -236,7 +277,7 @@ namespace SerialPortService.Services
 
         private void WaitPipelineTasksForStop()
         {
-            if (_ioTask == null && _parseTask == null && _sendTask == null && _rawBytesLoggerTask == null)
+            if (_ioTask == null && _parseTask == null && _sendTask == null && _rawBytesLoggerTask == null && _parsedEventDispatchTask == null)
             {
                 return;
             }
@@ -246,6 +287,7 @@ namespace SerialPortService.Services
             if (_parseTask != null) tasks.Add(_parseTask);
             if (_sendTask != null) tasks.Add(_sendTask);
             if (_rawBytesLoggerTask != null) tasks.Add(_rawBytesLoggerTask);
+            if (_parsedEventDispatchTask != null) tasks.Add(_parsedEventDispatchTask);
 
             try
             {
@@ -286,6 +328,7 @@ namespace SerialPortService.Services
             _cts = new CancellationTokenSource();
             _sendChannel = CreateSendChannel();
             _rawInputChannel = CreateRawInputChannel();
+            _parsedEventChannel = CreateParsedEventChannel();
 
             // 步骤3：按"读-解析-发送"顺序启动后台任务。
             // 为什么：拆分职责便于背压控制与性能观测。
@@ -293,6 +336,7 @@ namespace SerialPortService.Services
             StartPipelineTasks(_cts.Token);
 
             Logger.AddLog(LogLevel.Information, $"[{Name}] Pipeline 引擎已启动");
+            RecordDiagnosticEvent("lifecycle", "pipeline started");
         }
 
         /// <summary>
@@ -319,22 +363,50 @@ namespace SerialPortService.Services
                 return;
             }
 
+            var closeWatch = Stopwatch.StartNew();
             _lastCloseSucceeded = true;
+            Interlocked.Exchange(ref _closeState, (int)PortCloseState.Running);
+            RecordDiagnosticEvent("lifecycle", "close started");
 
-            // 步骤1：先标记停止并关闭通道写端。
-            // 为什么：通知后台任务尽快退出循环。
-            // 风险点：若不先停写，关闭期间可能继续有新消息进入。
-            StopAndCompleteChannels();
+            try
+            {
+                // 步骤1：先标记停止并关闭通道写端。
+                // 为什么：通知后台任务尽快退出循环。
+                // 风险点：若不先停写，关闭期间可能继续有新消息进入。
+                StopAndCompleteChannels();
 
-            // 步骤2：优先关闭底层串口句柄以打断阻塞读写。
-            // 为什么：部分驱动下 ReadAsync 取消不敏感，需关闭句柄触发退出。
-            // 风险点：若先等待任务再关句柄，UI 线程可能长时间阻塞。
-            TryCloseSerialPort();
+                // 步骤2：优先关闭底层串口句柄以打断阻塞读写。
+                // 为什么：部分驱动下 ReadAsync 取消不敏感，需关闭句柄触发退出。
+                // 风险点：若先等待任务再关句柄，UI 线程可能长时间阻塞。
+                TryCloseSerialPort();
 
-            // 步骤3：等待后台任务有序结束。
-            // 为什么：尽量避免在任务运行中直接关闭串口句柄。
-            // 风险点：强行关闭会导致对象释放异常和数据中断。
-            WaitPipelineTasksForStop();
+                // 步骤3：等待后台任务有序结束。
+                // 为什么：尽量避免在任务运行中直接关闭串口句柄。
+                // 风险点：强行关闭会导致对象释放异常和数据中断。
+                WaitPipelineTasksForStop();
+            }
+            catch (Exception ex)
+            {
+                _lastCloseSucceeded = false;
+                Interlocked.Exchange(ref _closeState, (int)PortCloseState.Faulted);
+                RecordDiagnosticError("close", ex.Message);
+                throw;
+            }
+            finally
+            {
+                closeWatch.Stop();
+                Interlocked.Exchange(ref _lastCloseDurationMs, closeWatch.ElapsedMilliseconds);
+                if (_lastCloseSucceeded)
+                {
+                    Interlocked.Exchange(ref _closeState, (int)PortCloseState.Completed);
+                    RecordDiagnosticEvent("close", $"completed in {closeWatch.ElapsedMilliseconds} ms");
+                }
+                else if ((PortCloseState)Volatile.Read(ref _closeState) != PortCloseState.Faulted)
+                {
+                    Interlocked.Exchange(ref _closeState, (int)PortCloseState.TimedOut);
+                    RecordDiagnosticError("close", $"timed out after {closeWatch.ElapsedMilliseconds} ms");
+                }
+            }
         }
 
         /// <summary>
@@ -391,5 +463,31 @@ namespace SerialPortService.Services
 
             _cts?.Dispose();
         }
+
+        public PortRuntimeSnapshot GetRuntimeSnapshot()
+        {
+            return new PortRuntimeSnapshot(
+                Name,
+                _isRunning,
+                _port.IsOpen,
+                _lastCloseSucceeded,
+                (PortCloseState)Volatile.Read(ref _closeState),
+                Interlocked.Read(ref _lastCloseDurationMs),
+                Interlocked.Read(ref _rawReadByteTotal),
+                Interlocked.Read(ref _rawReadChunkSeq),
+                Interlocked.Read(ref _parsedEventDropCount),
+                Interlocked.Read(ref _reconnectCycleCount),
+                Interlocked.Read(ref _reconnectExhaustedCount),
+                Volatile.Read(ref _lastReconnectReason),
+                Interlocked.Read(ref _lastReconnectUtcTicks),
+                _recentEvents.Snapshot(),
+                _recentErrors.Snapshot());
+        }
+
+        public IReadOnlyList<PortDiagnosticEvent> GetRecentEvents()
+            => _recentEvents.Snapshot();
+
+        public IReadOnlyList<PortDiagnosticEvent> GetRecentErrors()
+            => _recentErrors.Snapshot();
     }
 }

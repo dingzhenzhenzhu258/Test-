@@ -1,104 +1,44 @@
+using Microsoft.Extensions.Logging;
 using SerialPortService.Models;
 using SerialPortService.Services.Interfaces;
-using SerialPortService.Services.Protocols.Modbus; // 新的命名空间
-using Microsoft.Extensions.Logging;
+using SerialPortService.Services.Protocols.Modbus;
 using System;
 using System.Collections.Generic;
 using System.IO.Ports;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace SerialPortService.Services.Handler
 {
     /// <summary>
     /// Modbus 处理器。
-    /// 基于 <see cref="GenericHandler{T}"/> 复用通用收发能力，仅保留 Modbus 特有的响应匹配规则。
-    /// 
-    /// 【使用场景指南】
-    /// 1. 主动式控制端 (推拉结合/主动请求)：
-    ///    - 场景：作为 Client 向设备发起特定寄存器读写。
-    ///    - 推荐 API: 使用 <see cref="SendRequestAsync"/>，该方法内部提供自动重试、超时控制，适合精准请求对应响应的流程验证。
-    /// 2. 被动高频接收 (独立数据流)：
-    ///    - 场景：处理设备主动上报（或高频次底层周期性拉取），单纯监听有效帧避免挤压阻塞。
-    ///    - 推荐 API: 使用 <see cref="ReadParsedPacketsAsync"/> (<c>IAsyncEnumerable</c>)，业务只需 `await foreach` 即可连续消费完成解析的最新数据包，独立于发送请求的流控制。
+    /// 基于 GenericHandler 复用通用收发能力，协议特有匹配规则由协议定义提供。
     /// </summary>
     public class ModbusHandler : GenericHandler<ModbusPacket>, IModbusContext
     {
-        /// <summary>
-        /// Modbus 请求/响应匹配策略。
-        /// 按 SlaveId + FunctionCode（去异常位 0x80）进行匹配。
-        /// </summary>
-        private sealed class ModbusResponseMatcher : IResponseMatcher<ModbusPacket>
-        {
-            /// <summary>
-            /// 判断响应报文是否与当前请求匹配。
-            /// </summary>
-            /// <param name="response">响应报文</param>
-            /// <param name="command">原始请求报文</param>
-            /// <returns>是否匹配</returns>
-            public bool IsResponseMatch(ModbusPacket response, byte[] command)
-            {
-                if (response == null || command == null || command.Length < 2) return false;
+        private static readonly ModbusProtocolDefinition s_protocolDefinition = new();
 
-                byte slaveId = command[0];
-                byte funcCode = command[1];
-                byte actualFunc = (byte)(response.FunctionCode & 0x7F);
-                return response.SlaveId == slaveId && actualFunc == funcCode;
-            }
-
-            /// <summary>
-            /// 判断当前报文是否为主动上报报文。
-            /// </summary>
-            public bool IsReportPacket(ModbusPacket response) => false;
-
-            /// <summary>
-            /// 处理主动上报报文。
-            /// </summary>
-            public void OnReportPacket(ModbusPacket response) { }
-
-            /// <summary>
-            /// 构建未匹配报文的诊断日志。
-            /// </summary>
-            public string BuildUnmatchedLog(ModbusPacket response)
-                => $"Slave={response.SlaveId}, Func=0x{response.FunctionCode:X2}, Raw={BitConverter.ToString(response.RawFrame)}";
-        }
-
-        /// <summary>
-        /// 创建 Modbus 处理器。
-        /// </summary>
-        /// <param name="portName">串口名称</param>
-        /// <param name="baudRate">波特率</param>
-        /// <param name="parity">校验位</param>
-        /// <param name="dataBits">数据位</param>
-        /// <param name="stopBits">停止位</param>
-        /// <param name="logger">日志实例</param>
-        /// <param name="options">通用处理器配置</param>
         public ModbusHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger, GenericHandlerOptions? options = null)
-            : base(portName, baudRate, parity, dataBits, stopBits, new ModbusRtuParser(), logger, options, new ModbusResponseMatcher())
+            : this(portName, baudRate, parity, dataBits, stopBits, s_protocolDefinition.CreateParser(), logger, options)
         {
         }
 
-        /// <summary>
-        /// 发送 Modbus 请求并等待响应。
-        /// </summary>
-        /// <param name="command">完整的 Modbus 报文</param>
-        /// <param name="timeout">超时时间 (毫秒)</param>
-        /// <param name="retryCount">超时后的重试次数</param>
-        /// <param name="cancellationToken">外部取消令牌</param>
-        /// <returns>响应报文</returns>
-        public async Task<ModbusPacket> SendRequestAsync(byte[] command, int timeout = 1000, int retryCount = 3, CancellationToken cancellationToken = default)
-            // 步骤1：复用通用发送核心流程。
-            // 为什么：统一超时、重试、匹配、告警策略。
-            // 风险点：若各协议各自实现，行为易分叉且难维护。
-            => await SendRequestCoreAsync(command, timeout, retryCount, cancellationToken);
+        public ModbusHandler(
+            string portName,
+            int baudRate,
+            Parity parity,
+            int dataBits,
+            StopBits stopBits,
+            IStreamParser<ModbusPacket> parser,
+            ILogger logger,
+            GenericHandlerOptions? options = null)
+            : base(portName, baudRate, parity, dataBits, stopBits, parser ?? throw new ArgumentNullException(nameof(parser)), logger, options, s_protocolDefinition.CreateResponseMatcher())
+        {
+        }
 
-        /// <summary>
-        /// 读取解析完成的 Modbus 报文流。
-        /// 解析线程产出完整报文后写入通道，业务线程可独立异步消费。
-        /// </summary>
-        /// <param name="cancellationToken">读取取消令牌</param>
-        /// <returns>解析后的 Modbus 报文异步流</returns>
+        public async Task<ModbusPacket> SendRequestAsync(byte[] command, int timeout = 1000, int retryCount = 3, CancellationToken cancellationToken = default)
+            => await SendRequestCoreAsync(command, timeout, retryCount, cancellationToken).ConfigureAwait(false);
+
         public override IAsyncEnumerable<ModbusPacket> ReadParsedPacketsAsync(CancellationToken cancellationToken = default)
             => base.ReadParsedPacketsAsync(cancellationToken);
     }

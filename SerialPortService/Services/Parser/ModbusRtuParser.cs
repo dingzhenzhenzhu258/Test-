@@ -49,6 +49,8 @@ namespace SerialPortService.Services.Protocols.Modbus
             _functions = new ModbusFunction?[256];
             
             Register(new ReadHoldingRegisters());
+            Register(new ReadInputRegisters());
+            Register(new WriteSingleCoil());
             Register(new WriteSingleRegister());
             Register(new WriteMultipleRegisters());
             Register(new ErrorFunction());

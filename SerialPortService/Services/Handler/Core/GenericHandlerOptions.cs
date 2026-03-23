@@ -40,6 +40,57 @@ namespace SerialPortService.Services.Handler
         public int WaitModeQueueCapacity { get; init; } = 4096;
 
         /// <summary>
+        /// 基础发送通道容量。
+        /// 适用于所有 <see cref="PortContext{T}"/>，用于限制待发送命令积压。
+        /// </summary>
+        public int SendChannelCapacity { get; init; } = 512;
+
+        /// <summary>
+        /// 原始输入块通道容量。
+        /// 读取线程与解析线程之间通过该通道解耦，过小会放大读取等待，过大会增加驻留内存。
+        /// </summary>
+        public int RawInputChannelCapacity { get; init; } = 500;
+
+        /// <summary>
+        /// 单次从串口底层流读取的块大小（字节）。
+        /// </summary>
+        public int RawReadBufferSize { get; init; } = 4096;
+
+        /// <summary>
+        /// 串口驱动层读缓冲区大小（字节）。
+        /// </summary>
+        public int SerialPortReadBufferSize { get; init; } = 1024 * 1024;
+
+        /// <summary>
+        /// 是否输出每个原始读块的十六进制日志。
+        /// 高频采集默认应关闭，否则会明显放大 CPU、字符串分配和磁盘 IO。
+        /// </summary>
+        public bool EnableRawReadChunkLog { get; init; } = false;
+
+        /// <summary>
+        /// 原始字节统计日志间隔（秒）。
+        /// 设为 0 或负数表示关闭定时统计日志。
+        /// </summary>
+        public int RawBytesLogIntervalSeconds { get; init; } = 60;
+
+        /// <summary>
+        /// 是否将 <c>OnHandleChanged</c> 事件从解析线程异步分发到独立通道。
+        /// 高频采集默认建议开启，避免事件订阅方阻塞解析主路径。
+        /// </summary>
+        public bool DispatchParsedEventAsync { get; init; } = true;
+
+        /// <summary>
+        /// <c>OnHandleChanged</c> 事件分发通道容量。
+        /// </summary>
+        public int ParsedEventChannelCapacity { get; init; } = 1024;
+
+        /// <summary>
+        /// <c>OnHandleChanged</c> 事件分发通道满载策略。
+        /// 默认使用 <see cref="BoundedChannelFullMode.DropOldest"/> 以优先保留最新事件。
+        /// </summary>
+        public BoundedChannelFullMode ParsedEventChannelFullMode { get; init; } = BoundedChannelFullMode.DropOldest;
+
+        /// <summary>
         /// 指标标签：协议名称。
         /// 若为空，会自动回退到解析器类型名。
         /// </summary>

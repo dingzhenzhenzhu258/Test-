@@ -13,8 +13,8 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 创建声光报警器处理器。
         /// </summary>
-        public AudibleVisualAlarmHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
-            : base(portName, baudRate, parity, dataBits, stopBits, logger)
+        public AudibleVisualAlarmHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger, GenericHandlerOptions? options = null)
+            : base(portName, baudRate, parity, dataBits, stopBits, logger, options)
         {
             // 步骤1：将“最后发送报文访问器”注入解析器。
             // 为什么：解析器需要在收包时做发送-接收一致性比对。

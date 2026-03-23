@@ -1,189 +1,158 @@
-# SerialPortService 使用说明
+# SerialPortService
 
-`SerialPortService` 是统一串口通信库，提供：
+`SerialPortService` 是面向高频串口采集和协议扩展的核心类库，当前版本只保留新的实例级扩展模型。
 
-- 多协议统一接入（默认 Modbus + 可扩展自定义协议）
-- 高并发采集优化（异步 IO + Channel + 限流策略）
-- 请求/响应匹配与重试超时
-- 指标上报（可接 OpenTelemetry / OpenObserve）
-- 断线自动重连（可配置）
+## 当前约束
 
----
+- 设备上下文扩展走 `RegisterContextRegistration(...)`
+- 协议解析器扩展走 `RegisterParser<T>(...)`
+- 需要可重启的自定义协议端口优先走 `OpenPortAsync<T>(..., Func<IStreamParser<T>> parserFactory)`
+- 配置节只认 `SerialPortService:GenericHandlerOptions`
+- 不再保留旧的全局注册语义
+- 不再保留旧配置节 `SerialPortService:GenericHandler`
 
-## 文档入口
+## 核心能力
 
-- API + 使用文档：`docs/SerialPortService-API-Usage.md`
-- 指标看板与告警建议：`docs/SerialPortService-Metrics-Runbook.md`
-- 版本与兼容性说明：`docs/SerialPortService-Versioning.md`
-- 场景配置示例：`docs/SerialPortService-Scenario-Configs.md`
+- 高速采集管线：异步 IO、发送队列、原始字节缓冲、解析事件通道
+- 运行时诊断：超时率、积压告警、重连失败率、运行快照、最近事件/错误窗口
+- 协议扩展：内置 Modbus RTU、自定义协议，支持实例级解析器注册
+- 设备扩展：内置扫码枪、控制器、温度传感器、伺服、自定义协议处理器
+- 请求模型：支持请求-响应和被动持续采集两类模式
+- 运维接口：服务级健康快照、服务级诊断报告、单口运行时快照、单口/批量端口重启
 
----
-
-## 项目结构
-
-```
-SerialPortService/
-├── Extensions/                       # DI 注册扩展（AddSerialPortService）
-├── Helpers/                          # 工具方法（CRC 等）
-├── Models/
-│   ├── Enums/                        # 所有枚举（HandleEnum / ProtocolEnum / AlarmEnums 等）
-│   ├── Modbus/                       # Modbus 专属模型（ModbusPacket / ModbusException）
-│   ├── CustomFrame.cs                # 自定义协议帧
-│   ├── DataPacket.cs
-│   ├── OperateResult.cs
-│   └── ProtocolExceptions.cs         # 通用协议异常
-├── Services/
-│   ├── Handler/
-│   │   ├── Core/                     # 基础设施（GenericHandler / ParserPortContext / IResponseMatcher / Options）
-│   │   ├── Devices/                  # 具体设备处理器（ModbusHandler / AudibleVisualAlarmHandler 等）
-│   │   └── Metrics/                  # 指标快照、发布器、提供者接口（全 internal）
-│   ├── Interfaces/                   # ISerialPortService / IPortContext / IStreamParser 等
-│   ├── Parser/                       # 协议解析器（ModbusRtuParser / BarcodeParser / CustomProtocolParser 等）
-│   ├── Protocols/Modbus/Functions/   # Modbus 功能码帧构建
-│   ├── PortContext.cs                # 串口上下文基类（生命周期 + Send）
-│   ├── PortContext.Pipeline.cs       # IO读取 / 解析 / 发送 / 诊断日志循环（partial）
-│   ├── PortContext.Reconnect.cs      # 重连逻辑与失败率告警（partial）
-│   ├── PortContextFactory.cs         # 上下文工厂（设备路由 / 协议推断）
-│   ├── ParserFactory.cs              # 解析器工厂
-│   ├── SerialPortServiceBase.cs      # 对外服务实现（OpenPort / ClosePort / Write / TryWrite）
-│   └── SerialPortReconnectPolicy.cs  # 全局重连策略（进程级静态配置）
-└── docs/
-```
-
----
-
-## 快速开始
+## 快速使用
 
 ```csharp
 var options = new GenericHandlerOptions
 {
-    ResponseChannelCapacity = 512,
-    SampleLogInterval = 200,
-    DropWhenNoActiveRequest = true,
-    ResponseChannelFullMode = BoundedChannelFullMode.Wait,
-    ReconnectIntervalMs = 1000,
-    MaxReconnectAttempts = 3
+    ResponseChannelCapacity = 4096,
+    WaitModeQueueCapacity = 8192,
+    SendChannelCapacity = 2048,
+    RawInputChannelCapacity = 2048,
+    DispatchParsedEventAsync = true,
+    WaitBacklogAlertThreshold = 2048
 };
 
 var service = new SerialPortServiceBase(loggerFactory, options);
 
-// 推荐：异步打开（避免 sync-over-async，不阻塞 UI 线程）
-var result = await service.OpenPortAsync("COM3", 9600, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
-
-// 向后兼容：同步打开（内部通过 Task.Run 跳过 SyncContext）
-// var result = service.OpenPort("COM3", 9600, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
+var open = await service.OpenPortAsync(
+    "COM3",
+    9600,
+    Parity.None,
+    8,
+    StopBits.One,
+    HandleEnum.Default,
+    ProtocolEnum.ModbusRTU);
 ```
 
----
+## 扩展示例
 
-## 关键建议
-
-- 所有项目统一通过你自定义 `Logger` 库写日志。
-- 每个应用都从 `appsettings.json` 读取 `GenericHandlerOptions` 后注入。
-- 上线后优先关注：`serialport.handler.timeout_count`、`serialport.handler.wait_backlog`，以及 `Reconnect failure-rate alert` 日志。
-
----
-
-## 写入错误语义（生产必读）
-
-- `Write(portName, data)`：异常语义。端口未打开或发送失败会抛异常。
-- `TryWrite(portName, data)`：结果语义。失败时返回 `OperateResult<byte[]>`，不抛异常。
-
-生产场景建议优先使用 `TryWrite`，并将失败分支接入统一重试与告警。
-
-## 打开 / 关闭接口语义
-
-- `OpenPort(...)` / `OpenPort<T>(...)` ：同步打开（内部通过 `Task.Run` 避免 UI 线程死锁）。
-- `OpenPortAsync(...)` / `OpenPortAsync<T>(...)` ：**推荐**。真正异步打开，不阻塞调用线程。
-- `ClosePortAsync(portName)` ：异步关闭单个端口（3s 超时保护）。
-- `CloseAll()` ：同步关闭全部端口（每端口 3s 超时保护）。
-- `CloseAllAsync()` ：**推荐**。异步关闭全部端口（每端口 3s 超时保护）。
-
-新代码建议统一使用 Async 版本。
-
-## 场景与接口选择
-
-| 场景 | 通信模式 | 推荐接口 | 说明 |
-| --- | --- | --- | --- |
-| 主动控制 / 一问一答 | Push Request → Matched Response | `SendRequestAsync(...)` | 适合标准 Modbus 主从轮询、显式读写寄存器、控制类命令。 |
-| 被动持续采集 | Push Device Data → Pull by Stream | `ReadParsedPacketsAsync(...)` | 适合设备主动上报、连续测量流、扫码流。业务层使用 `await foreach` 持续消费。 |
-| 仅发送、不关心匹配响应 | Push Only | `TryWrite(...)` | 适合告警灯、简单触发命令、业务自行处理失败重试。 |
-| UI / 轻量通知 | Push Callback | `OnHandleChanged` | 适合页面刷新、轻量提示；不适合高吞吐重处理。 |
-
-选择原则：
-
-- **需要“请求-响应匹配、超时、重试”**：优先选 `SendRequestAsync`。
-- **设备自己持续上报数据**：优先选 `ReadParsedPacketsAsync`。
-- **只想发命令，失败不抛异常**：优先选 `TryWrite`。
-- **只做简单通知**：可用 `OnHandleChanged`，但不要在回调里做重 IO 或长耗时逻辑。
-
----
-
-## 高压测试建议流程
-
-1. **短压**（5~10 分钟）
-   - 验证发送吞吐与平均响应时延是否稳定。
-2. **长压**（24h+）
-   - 验证内存、任务数量、重连行为是否持续稳定。
-3. **故障注入压测**
-   - 断线、抖动、噪声、设备迟到响应、端口占用冲突。
-
-压测期间重点关注：
-
-- `serialport.handler.timeout_count`
-- `serialport.handler.wait_backlog`
-- `Reconnect failure-rate alert` 日志
-
----
-
-## 解析报文消费示例
-
-下面示例展示如何在 README 中快速使用 `ReadParsedPacketsAsync`、事件订阅和覆写 `OnParsed` 三种消费方式（详见 `docs/SerialPortService-API-Usage.md`）。
-
-1) 异步流消费（适合高吞吐）
+### 注册新的设备上下文
 
 ```csharp
-// 假设已通过 service.OpenPort(...) 得到 modbusHandler: ModbusHandler
-var cts = new CancellationTokenSource();
-_ = Task.Run(async () =>
+var result = service.RegisterContextRegistration(
+    "040_my_device",
+    new MyDeviceRegistration());
+
+if (!result.IsSuccess)
 {
-    try
+    Console.WriteLine(result.Message);
+}
+```
+
+### 注册新的协议解析器
+
+```csharp
+var parserResult = service.RegisterParser(
+    ProtocolEnum.ModbusASCII,
+    "050_ascii_text",
+    static () => new MyAsciiParser());
+```
+
+### 查看服务健康状态
+
+```csharp
+var health = service.GetHealthSnapshot();
+
+foreach (var port in health.Ports)
+{
+    Console.WriteLine($"{port.PortName} running={port.IsRunning} closeState={port.CloseState}");
+}
+```
+
+### 查看单口快照并执行重启
+
+```csharp
+var snapshot = service.GetPortRuntimeSnapshot("COM3");
+var restart = await service.RestartPortAsync("COM3");
+var batch = await service.RestartPortsAsync(new[] { "COM3", "COM4" });
+```
+
+### 使用 parser factory 打开可重启的自定义协议端口
+```csharp
+var open = await service.OpenPortAsync(
+    "COM5",
+    115200,
+    Parity.None,
+    8,
+    StopBits.One,
+    static () => new MyFrameParser());
+```
+
+### 被动持续采集
+
+```csharp
+if (service.TryGetContext("COM3", out var ctx) && ctx is ModbusHandler modbus)
+{
+    using var cts = new CancellationTokenSource();
+
+    await foreach (var packet in modbus.ReadParsedPacketsAsync(cts.Token))
     {
-        await foreach (var pkt in modbusHandler.ReadParsedPacketsAsync(cts.Token))
-        {
-            // 异步持久化或转发
-            _ = Task.Run(() => PersistPacketAsync(pkt));
-        }
-    }
-    catch (OperationCanceledException) { }
-});
-
-// 取消示例
-// cts.Cancel();
-```
-
-2) 事件订阅（适合 UI / 轻量通知）
-
-```csharp
-modbusContext.OnHandleChanged += (sender, e) =>
-{
-    var result = (OperateResult<ModbusPacket>)e;
-    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Content));
-};
-```
-
-3) 覆写 `OnParsed`（适合协议内部高性能处理）
-
-```csharp
-public class MyHandler : GenericHandler<ModbusPacket>
-{
-    protected override void OnParsed(ModbusPacket pkt)
-    {
-        base.OnParsed(pkt); // 保留分发与统计
-        // 直接内存聚合或发送到高性能队列，不要阻塞
-        _localQueue.Enqueue(pkt);
+        await PersistAsync(packet);
     }
 }
 ```
 
-更多细节与注意事项请参见 `docs/SerialPortService-API-Usage.md`。
+## 推荐接口选择
+
+- 一问一答控制场景：优先 `SendRequestAsync(...)`
+- 被动持续上报场景：优先 `ReadParsedPacketsAsync(...)`
+- 只发送不关心匹配响应：优先 `TryWrite(...)`
+- 新代码优先 `OpenPortAsync(...)` / `CloseAllAsync()`
+
+## 配置
+
+只使用下面这个配置节：
+
+```json
+{
+  "SerialPortService": {
+    "GenericHandlerOptions": {
+      "ResponseChannelCapacity": 4096,
+      "WaitModeQueueCapacity": 8192,
+      "SendChannelCapacity": 2048,
+      "RawInputChannelCapacity": 2048,
+      "RawReadBufferSize": 8192,
+      "SerialPortReadBufferSize": 1048576,
+      "EnableRawReadChunkLog": false,
+      "RawBytesLogIntervalSeconds": 60,
+      "DispatchParsedEventAsync": true,
+      "ParsedEventChannelCapacity": 2048,
+      "ParsedEventChannelFullMode": "DropOldest",
+      "WaitBacklogAlertThreshold": 2048
+    },
+    "RequestDefaults": {
+      "TimeoutMs": 1000,
+      "RetryCount": 3
+    }
+  }
+}
+```
+
+## 文档
+
+- `docs/SerialPortService-API-Usage.md`
+- `docs/SerialPortService-Scenario-Configs.md`
+- `docs/SerialPortService-VirtualCom-Smoke.md`
+- `docs/SerialPortService-VirtualCom-LongRun.md`
+- `docs/SerialPortService-Metrics-Runbook.md`

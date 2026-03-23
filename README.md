@@ -11,9 +11,9 @@
 - `Test-High-speed acquisition`：WPF 客户端示例程序，演示如何使用串口服务进行高频轮询采集、并行持久化、UI 展示与诊断。
 
 核心功能亮点
-- 可插拔的设备 Handler：通过 `RegisterHandlerFactory` 或实现内置 Handler（例如 `ModbusHandler`、`BarcodeScannerHandler`、`CustomProtocolHandler`）扩展新设备类型。
-- 可替换的协议解析器：实现 `IStreamParser<T>` 即可将自定义帧解析器注入到上下文（示例：`CustomProtocolParser`）。
-- 全局重连与告警策略：`GenericHandlerOptions` 和 `SerialPortReconnectPolicy` 支持进程级重连参数与指标告警阈值。
+- 可插拔的设备/协议路由：通过 `RegisterContextRegistration(...)` 接入新设备或新协议，内置示例包括 `ModbusHandler`、`BarcodeScannerHandler`、`CustomProtocolHandler`。
+- 可替换的协议解析器：实现 `IStreamParser<T>` 后，可通过 `RegisterParser<T>(...)` 注册，或通过 `OpenPortAsync<T>(..., Func<IStreamParser<T>> parserFactory)` 直接打开自定义协议端口。
+- 实例级重连与告警策略：`GenericHandlerOptions` 与重连参数按服务实例、端口下发，不再依赖全局静态策略。
 - 可靠的关闭流程：对物理驱动死锁场景有超时保护并强制剥离句柄避免界面阻塞。
 - 日志与 UI 事件：`LoggerHelper` 支持结构化日志、异常堆栈记录和通过事件推送 UI 层展示。
 
@@ -31,7 +31,7 @@ _serialPortService.OpenPort("COM1", 115200, Parity.None, 8, StopBits.One, Handle
 ```
 - 使用自定义解析器打开串口：
 ```csharp
-_serialPortService.OpenPort("COM1", 115200, Parity.None, 8, StopBits.One, new CustomProtocolParser());
+await _serialPortService.OpenPortAsync("COM1", 115200, Parity.None, 8, StopBits.One, static () => new CustomProtocolParser());
 ```
 - 同步发送并等待回包（示例）：
 ```csharp

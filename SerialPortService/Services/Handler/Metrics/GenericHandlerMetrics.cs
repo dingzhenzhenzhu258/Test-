@@ -14,7 +14,8 @@ namespace SerialPortService.Services.Handler
         long TotalLatencyMs,
         int ActiveRequests,
         long WaitBacklog,
-        long WaitBacklogHighWatermark)
+        long WaitBacklogHighWatermark,
+        long ParsedEventDropCount)
     {
         /// <summary>
         /// 平均成功匹配延迟（毫秒）。

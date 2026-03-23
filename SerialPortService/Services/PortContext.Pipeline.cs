@@ -17,7 +17,7 @@ namespace SerialPortService.Services
         /// </summary>
         private async Task IoReadLoopAsync(CancellationToken token)
         {
-            const int readSize = 4096;
+            var readSize = RuntimeOptions.RawReadBufferSize;
 
             while (_isRunning && !token.IsCancellationRequested)
             {
@@ -26,6 +26,7 @@ namespace SerialPortService.Services
                 {
                     if (!_port.IsOpen)
                     {
+                        RecordDiagnosticEvent("reconnect", "read loop detected closed port");
                         if (!await TryReconnectAsync(token, "port closed").ConfigureAwait(false))
                         {
                             break;
@@ -45,7 +46,7 @@ namespace SerialPortService.Services
                         var seq = Interlocked.Increment(ref _rawReadChunkSeq);
                         var totalBytes = Interlocked.Add(ref _rawReadByteTotal, count);
 
-                        if (EnableRawReadChunkLog)
+                        if (RuntimeOptions.EnableRawReadChunkLog)
                         {
                             Logger.AddLog(
                                 LogLevel.Information,
@@ -96,6 +97,7 @@ namespace SerialPortService.Services
                     if (_isRunning && !token.IsCancellationRequested)
                     {
                         Logger.AddLog(LogLevel.Error, $"[IO Error] {ex.Message}", exception: ex);
+                        RecordDiagnosticError("io-read", ex.Message);
                         if (!await TryReconnectAsync(token, "read failed").ConfigureAwait(false))
                         {
                             break;
@@ -136,6 +138,7 @@ namespace SerialPortService.Services
                         catch (Exception ex) when (!token.IsCancellationRequested)
                         {
                             Logger.AddLog(LogLevel.Error, $"[Parse Error] Port={Name}, ChunkLength={chunk.Length}, {ex.Message}", exception: ex);
+                            RecordDiagnosticError("parse", ex.Message);
                             resultList.Clear();
                             continue;
                         }
@@ -151,20 +154,13 @@ namespace SerialPortService.Services
                                 catch (Exception ex) when (!token.IsCancellationRequested)
                                 {
                                     Logger.AddLog(LogLevel.Error, $"[OnParsed Error] Port={Name}, {ex.Message}", exception: ex);
+                                    RecordDiagnosticError("on-parsed", ex.Message);
                                 }
 
                                 var handler = OnHandleChanged;
                                 if (handler != null)
                                 {
-                                    try
-                                    {
-                                        var operateResult = new OperateResult<T>(result, true, "Success");
-                                        handler(this, operateResult);
-                                    }
-                                    catch (Exception ex) when (!token.IsCancellationRequested)
-                                    {
-                                        Logger.AddLog(LogLevel.Error, $"[OnHandleChanged Error] Port={Name}, {ex.Message}", exception: ex);
-                                    }
+                                    DispatchParsedEvent(handler, result, token);
                                 }
                             }
                             resultList.Clear();
@@ -194,6 +190,7 @@ namespace SerialPortService.Services
                     if (!_port.IsOpen && !await TryReconnectAsync(token, "write path detected closed port").ConfigureAwait(false))
                     {
                         Logger.AddLog(LogLevel.Error, $"[IO Write] Send dropped due to reconnect failure. Port={Name}, Bytes={msg.Data.Length}");
+                        RecordDiagnosticError("io-write", $"send dropped after reconnect failure, bytes={msg.Data.Length}");
                         continue;
                     }
 
@@ -205,6 +202,7 @@ namespace SerialPortService.Services
                     catch (Exception ex) when (!token.IsCancellationRequested)
                     {
                         Logger.AddLog(LogLevel.Error, $"[IO Write] {ex.Message}", exception: ex);
+                        RecordDiagnosticError("io-write", ex.Message);
                         await TryReconnectAsync(token, "write failed").ConfigureAwait(false);
                     }
                 }
@@ -213,6 +211,7 @@ namespace SerialPortService.Services
             catch (Exception ex) when (!token.IsCancellationRequested)
             {
                 Logger.AddLog(LogLevel.Error, $"[IO Write] {ex.Message}", exception: ex);
+                RecordDiagnosticError("io-write", ex.Message);
             }
         }
 
@@ -221,16 +220,22 @@ namespace SerialPortService.Services
         /// </summary>
         private async Task RawBytesLoggerLoop(CancellationToken token)
         {
+            var intervalSeconds = RuntimeOptions.RawBytesLogIntervalSeconds;
+            if (intervalSeconds <= 0)
+            {
+                return;
+            }
+
             try
             {
                 while (!token.IsCancellationRequested)
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(1), token).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(intervalSeconds), token).ConfigureAwait(false);
 
                     var bytesCount = Interlocked.Exchange(ref _rawBytesSinceLastLog, 0);
                     if (bytesCount > 0)
                     {
-                        Logger.AddLog(LogLevel.Information, $"[{Name}] Raw bytes received in last minute: {bytesCount:N0} bytes");
+                        Logger.AddLog(LogLevel.Information, $"[{Name}] Raw bytes received in last {intervalSeconds}s: {bytesCount:N0} bytes");
                     }
                 }
             }
@@ -238,6 +243,66 @@ namespace SerialPortService.Services
             catch (Exception ex)
             {
                 Logger.AddLog(LogLevel.Error, $"[{Name}] RawBytesLoggerLoop failed: {ex.Message}", exception: ex);
+            }
+        }
+
+        private void DispatchParsedEvent(EventHandler<object> handler, T result, CancellationToken token)
+        {
+            var operateResult = new OperateResult<T>(result, true, "Success");
+            if (!RuntimeOptions.DispatchParsedEventAsync || _parsedEventChannel == null)
+            {
+                InvokeParsedEventHandler(handler, operateResult, token);
+                return;
+            }
+
+            if (!_parsedEventChannel.Writer.TryWrite((handler, (object)operateResult)))
+            {
+                var dropped = Interlocked.Increment(ref _parsedEventDropCount);
+                if (dropped == 1 || dropped % Math.Max(1, RuntimeOptions.SampleLogInterval) == 0)
+                {
+                    Logger.AddLog(LogLevel.Warning, $"[OnHandleChanged Drop] Port={Name}, Dropped={dropped}");
+                    RecordDiagnosticError("event-drop", $"parsed event dropped count={dropped}");
+                }
+            }
+        }
+
+        private async Task ParsedEventDispatchLoopAsync(CancellationToken token)
+        {
+            if (_parsedEventChannel == null)
+            {
+                return;
+            }
+
+            try
+            {
+                await foreach (var item in _parsedEventChannel.Reader.ReadAllAsync(token).ConfigureAwait(false))
+                {
+                    if (item is ValueTuple<EventHandler<object>, object> payload)
+                    {
+                        InvokeParsedEventHandler(payload.Item1, payload.Item2, token);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex) when (!token.IsCancellationRequested)
+            {
+                Logger.AddLog(LogLevel.Error, $"[ParsedEventDispatch Error] Port={Name}, {ex.Message}", exception: ex);
+                RecordDiagnosticError("event-dispatch", ex.Message);
+            }
+        }
+
+        private void InvokeParsedEventHandler(EventHandler<object> handler, object operateResult, CancellationToken token)
+        {
+            try
+            {
+                handler(this, operateResult);
+            }
+            catch (Exception ex) when (!token.IsCancellationRequested)
+            {
+                Logger.AddLog(LogLevel.Error, $"[OnHandleChanged Error] Port={Name}, {ex.Message}", exception: ex);
+                RecordDiagnosticError("event-handler", ex.Message);
             }
         }
     }

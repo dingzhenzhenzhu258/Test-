@@ -4,6 +4,7 @@ using SerialPortService.Models;
 using SerialPortService.Models.Enums;
 using SerialPortService.Services.Handler;
 using SerialPortService.Services.Interfaces;
+using SerialPortService.Services.Protocols;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -28,73 +29,39 @@ namespace SerialPortService.Services
     public class SerialPortServiceBase : ISerialPortService, IDisposable
     {
         private int _disposed;
-        private readonly record struct PortBinding(
+        private sealed record PortBinding(
             int BaudRate,
             Parity Parity,
             int DataBits,
             StopBits StopBits,
             HandleEnum Handle,
             ProtocolEnum Protocol,
-            string? ParserType);
+            string BindingKey,
+            Func<IPortContext> ContextFactory,
+            string? ParserDescription = null);
 
         private readonly ILoggerFactory _loggerFactory;
         private readonly GenericHandlerOptions _genericHandlerOptions;
         private readonly Microsoft.Extensions.Logging.ILogger _logger;
         private readonly PortContextFactory _contextFactory;
-        private static PortBinding? configuredReconnectPolicy;
-        private static readonly object reconnectPolicyLock = new();
-        private static readonly object portOpenCloseLock = new();
+        private readonly IParserRegistry _parserRegistry;
+        private readonly IProtocolDefinitionRegistry _protocolDefinitions;
+        private readonly object _portOpenCloseLock = new();
+        private readonly ConcurrentDictionary<string, IPortContext> _ports = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, PortBinding> _portBindings = new(StringComparer.OrdinalIgnoreCase);
 
         public SerialPortServiceBase(ILoggerFactory? loggerFactory = null, GenericHandlerOptions? genericHandlerOptions = null)
         {
             _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
             _logger = _loggerFactory.CreateLogger<SerialPortServiceBase>();
             _genericHandlerOptions = genericHandlerOptions ?? new GenericHandlerOptions();
+            _parserRegistry = new ParserFactory();
+            _protocolDefinitions = new ProtocolDefinitionRegistry();
 
-            // 步骤1：构建可比较的重连策略快照。
-            // 为什么：需要在多实例场景中识别“谁改写了全局静态策略”。
-            // 风险点：若不做快照比较，配置漂移会静默发生且难以排查。
-            var currentReconnectPolicy = new PortBinding(
-                _genericHandlerOptions.ReconnectIntervalMs,
-                Parity.None,
-                _genericHandlerOptions.MaxReconnectAttempts,
-                StopBits.None,
-                HandleEnum.Default,
-                ProtocolEnum.Default,
-                $"{_genericHandlerOptions.ReconnectFailureRateAlertThresholdPercent}:{_genericHandlerOptions.ReconnectFailureRateAlertMinSamples}");
-
-            lock (reconnectPolicyLock)
-            {
-                // 步骤2：比较并记录策略漂移。
-                // 为什么：SerialPortReconnectPolicy 为进程级静态配置，后创建实例可能覆盖前者。
-                // 风险点：不同业务模块若使用不同重连参数，会出现“行为突然变化”。
-                if (configuredReconnectPolicy.HasValue && configuredReconnectPolicy.Value != currentReconnectPolicy)
-                {
-                    _logger.LogWarning("SerialPortReconnectPolicy is global static and has been reconfigured by another SerialPortServiceBase instance.");
-                }
-
-                configuredReconnectPolicy = currentReconnectPolicy;
-            }
-
-            // 步骤3：下发全局重连参数。
-            // 为什么：PortContext 的异常重连路径会读取该全局策略。
-            // 风险点：若未及时下发，重连行为可能沿用旧值导致告警误判。
-            SerialPortReconnectPolicy.Configure(
-                _genericHandlerOptions.ReconnectIntervalMs,
-                _genericHandlerOptions.MaxReconnectAttempts,
-                _genericHandlerOptions.ReconnectFailureRateAlertThresholdPercent,
-                _genericHandlerOptions.ReconnectFailureRateAlertMinSamples);
-
-            _contextFactory = new PortContextFactory(_loggerFactory, _genericHandlerOptions);
+            _contextFactory = new PortContextFactory(_loggerFactory, _genericHandlerOptions, _parserRegistry);
         }
 
-        /// <summary>
-        /// 串口上下文集合 key: 串口号 value: 串口上下文
-        /// </summary>
-        private static readonly ConcurrentDictionary<string, IPortContext> ports = new();
-        private static readonly ConcurrentDictionary<string, PortBinding> portBindings = new();
-
-        public static IReadOnlyDictionary<string, IPortContext> OnlyReadports => ports;
+        public IReadOnlyDictionary<string, IPortContext> OpenedPorts => _ports;
 
         /// <summary>
         /// 打开串口 (使用预定义设备枚举)
@@ -108,16 +75,16 @@ namespace SerialPortService.Services
                     return new OperateResult(false, "串口名不能为空", -1);
 
                 var resolvedProtocol = protocol;
-                lock (portOpenCloseLock)
+                lock (_portOpenCloseLock)
                 {
                     // 步骤1：校验端口重开参数一致性。
                     // 为什么：同端口复用旧上下文时必须保证参数一致。
                     // 风险点：参数漂移会造成“看似成功打开，实际用旧参数通信”。
-                    if (portBindings.TryGetValue(portName, out var existingBinding))
+                    if (_portBindings.TryGetValue(portName, out var existingBinding))
                     {
                         var requestedProtocol = protocol == ProtocolEnum.Default ? existingBinding.Protocol : protocol;
-                        var requestedBinding = new PortBinding(baudRate, parity, dataBits, stopBits, handleEnum, requestedProtocol, ParserType: null);
-                        if (existingBinding != requestedBinding)
+                        var requestedBindingKey = BuildBindingKey(baudRate, parity, dataBits, stopBits, handleEnum, requestedProtocol, parserDescription: null);
+                        if (!string.Equals(existingBinding.BindingKey, requestedBindingKey, StringComparison.Ordinal))
                         {
                             return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                         }
@@ -126,7 +93,7 @@ namespace SerialPortService.Services
                     // 步骤2：创建或复用端口上下文（GetOrAdd）。
                     // 为什么：在并发打开场景避免重复实例化上下文。
                     // 风险点：若无原子复用，可能出现多上下文竞争同一串口。
-                    var context = ports.GetOrAdd(portName, _ =>
+                    var context = _ports.GetOrAdd(portName, _ =>
                     {
                         var result = _contextFactory.Create(portName, baudRate, parity, dataBits, stopBits, handleEnum, protocol);
                         resolvedProtocol = result.ResolvedProtocol;
@@ -136,12 +103,13 @@ namespace SerialPortService.Services
                     // 步骤3：双检绑定一致性并写入绑定快照。
                     // 为什么：防止并发路径造成“上下文与绑定参数不一致”。
                     // 风险点：绑定状态错误会影响后续重开校验与排障。
-                    var binding = new PortBinding(baudRate, parity, dataBits, stopBits, handleEnum, resolvedProtocol, ParserType: null);
-                    if (portBindings.TryGetValue(portName, out var currentBinding) && currentBinding != binding)
+                    var binding = CreateBuiltInBinding(portName, baudRate, parity, dataBits, stopBits, handleEnum, resolvedProtocol);
+                    if (_portBindings.TryGetValue(portName, out var currentBinding)
+                        && !string.Equals(currentBinding.BindingKey, binding.BindingKey, StringComparison.Ordinal))
                     {
                         return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                     }
-                    portBindings.TryAdd(portName, binding);
+                    _portBindings.TryAdd(portName, binding);
 
                     // 步骤4：打开上下文并启动内部管线。
                     // 为什么：只有 Open 后才能启动 IO/解析/发送任务。
@@ -162,22 +130,29 @@ namespace SerialPortService.Services
         /// 打开串口 (使用自定义解析器)
         /// </summary>
         public OperateResult OpenPort<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, IStreamParser<T> parser) where T : class
+            => OpenPort(portName, baudRate, parity, dataBits, stopBits, CreateReusableParserFactory(parser));
+
+        /// <summary>
+        /// 打开串口 (使用自定义解析器工厂)
+        /// </summary>
+        public OperateResult OpenPort<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, Func<IStreamParser<T>> parserFactory) where T : class
         {
             try
             {
                 if (string.IsNullOrWhiteSpace(portName))
                     return new OperateResult(false, "串口名不能为空", -1);
 
-                ArgumentNullException.ThrowIfNull(parser);
+                ArgumentNullException.ThrowIfNull(parserFactory);
 
-                lock (portOpenCloseLock)
+                lock (_portOpenCloseLock)
                 {
                     // 步骤1：将解析器类型纳入绑定一致性校验。
                     // 为什么：同端口不同解析器本质上是不同协议语义。
                     // 风险点：若忽略解析器类型，可能把旧解析器误用于新协议数据流。
-                    var parserType = parser.GetType().FullName;
-                    var expected = new PortBinding(baudRate, parity, dataBits, stopBits, HandleEnum.Default, ProtocolEnum.Default, parserType);
-                    if (portBindings.TryGetValue(portName, out var existingBinding) && existingBinding != expected)
+                    var parser = CreateParser(parserFactory);
+                    var expected = CreateCustomBinding(portName, baudRate, parity, dataBits, stopBits, parserFactory, parser);
+                    if (_portBindings.TryGetValue(portName, out var existingBinding)
+                        && !string.Equals(existingBinding.BindingKey, expected.BindingKey, StringComparison.Ordinal))
                     {
                         return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                     }
@@ -185,12 +160,13 @@ namespace SerialPortService.Services
                     // 步骤2：创建或复用 GenericHandler<T>。
                     // 为什么：复用通用并发、重试、告警和指标能力。
                     // 风险点：若复用了错误上下文，会导致解析错位或请求匹配失败。
-                    var context = ports.GetOrAdd(portName, _ => new GenericHandler<T>(portName, baudRate, parity, dataBits, stopBits, parser, _loggerFactory.CreateLogger<GenericHandler<T>>(), _contextFactory.CreateTaggedOptions(HandleEnum.Default, ProtocolEnum.Default)));
-                    if (portBindings.TryGetValue(portName, out var currentBinding) && currentBinding != expected)
+                    var context = _ports.GetOrAdd(portName, _ => CreateCustomParserContext(portName, baudRate, parity, dataBits, stopBits, parserFactory, parser));
+                    if (_portBindings.TryGetValue(portName, out var currentBinding)
+                        && !string.Equals(currentBinding.BindingKey, expected.BindingKey, StringComparison.Ordinal))
                     {
                         return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                     }
-                    portBindings.TryAdd(portName, expected);
+                    _portBindings.TryAdd(portName, expected);
 
                     // 步骤3：打开上下文。
                     // 为什么：触发底层读写任务，开始处理串口数据。
@@ -221,16 +197,16 @@ namespace SerialPortService.Services
                 var resolvedProtocol = protocol;
                 IPortContext context;
 
-                lock (portOpenCloseLock)
+                lock (_portOpenCloseLock)
                 {
                     // 步骤1：校验端口重开参数一致性（同 OpenPort）。
                     // 为什么：同端口复用旧上下文时必须保证参数一致。
                     // 风险点：参数漂移会造成"看似成功打开，实际用旧参数通信"。
-                    if (portBindings.TryGetValue(portName, out var existingBinding))
+                    if (_portBindings.TryGetValue(portName, out var existingBinding))
                     {
                         var requestedProtocol = protocol == ProtocolEnum.Default ? existingBinding.Protocol : protocol;
-                        var requestedBinding = new PortBinding(baudRate, parity, dataBits, stopBits, handleEnum, requestedProtocol, ParserType: null);
-                        if (existingBinding != requestedBinding)
+                        var requestedBindingKey = BuildBindingKey(baudRate, parity, dataBits, stopBits, handleEnum, requestedProtocol, parserDescription: null);
+                        if (!string.Equals(existingBinding.BindingKey, requestedBindingKey, StringComparison.Ordinal))
                         {
                             return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                         }
@@ -239,7 +215,7 @@ namespace SerialPortService.Services
                     // 步骤2：创建或复用端口上下文。
                     // 为什么：在并发打开场景避免重复实例化上下文。
                     // 风险点：若无原子复用，可能出现多上下文竞争同一串口。
-                    context = ports.GetOrAdd(portName, _ =>
+                    context = _ports.GetOrAdd(portName, _ =>
                     {
                         var result = _contextFactory.Create(portName, baudRate, parity, dataBits, stopBits, handleEnum, protocol);
                         resolvedProtocol = result.ResolvedProtocol;
@@ -249,12 +225,13 @@ namespace SerialPortService.Services
                     // 步骤3：双检绑定一致性并写入绑定快照。
                     // 为什么：防止并发路径造成"上下文与绑定参数不一致"。
                     // 风险点：绑定状态错误会影响后续重开校验与排障。
-                    var binding = new PortBinding(baudRate, parity, dataBits, stopBits, handleEnum, resolvedProtocol, ParserType: null);
-                    if (portBindings.TryGetValue(portName, out var currentBinding) && currentBinding != binding)
+                    var binding = CreateBuiltInBinding(portName, baudRate, parity, dataBits, stopBits, handleEnum, resolvedProtocol);
+                    if (_portBindings.TryGetValue(portName, out var currentBinding)
+                        && !string.Equals(currentBinding.BindingKey, binding.BindingKey, StringComparison.Ordinal))
                     {
                         return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                     }
-                    portBindings.TryAdd(portName, binding);
+                    _portBindings.TryAdd(portName, binding);
                 }
 
                 // 步骤4：在锁外异步打开上下文，避免长时间持锁。
@@ -275,24 +252,31 @@ namespace SerialPortService.Services
         /// 异步打开串口（使用自定义解析器）。
         /// </summary>
         public async Task<OperateResult> OpenPortAsync<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, IStreamParser<T> parser) where T : class
+            => await OpenPortAsync(portName, baudRate, parity, dataBits, stopBits, CreateReusableParserFactory(parser)).ConfigureAwait(false);
+
+        /// <summary>
+        /// 异步打开串口（使用自定义解析器工厂）。
+        /// </summary>
+        public async Task<OperateResult> OpenPortAsync<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, Func<IStreamParser<T>> parserFactory) where T : class
         {
             try
             {
                 if (string.IsNullOrWhiteSpace(portName))
                     return new OperateResult(false, "串口名不能为空", -1);
 
-                ArgumentNullException.ThrowIfNull(parser);
+                ArgumentNullException.ThrowIfNull(parserFactory);
 
                 IPortContext context;
 
-                lock (portOpenCloseLock)
+                lock (_portOpenCloseLock)
                 {
                     // 步骤1：将解析器类型纳入绑定一致性校验。
                     // 为什么：同端口不同解析器本质上是不同协议语义。
                     // 风险点：若忽略解析器类型，可能把旧解析器误用于新协议数据流。
-                    var parserType = parser.GetType().FullName;
-                    var expected = new PortBinding(baudRate, parity, dataBits, stopBits, HandleEnum.Default, ProtocolEnum.Default, parserType);
-                    if (portBindings.TryGetValue(portName, out var existingBinding) && existingBinding != expected)
+                    var parser = CreateParser(parserFactory);
+                    var expected = CreateCustomBinding(portName, baudRate, parity, dataBits, stopBits, parserFactory, parser);
+                    if (_portBindings.TryGetValue(portName, out var existingBinding)
+                        && !string.Equals(existingBinding.BindingKey, expected.BindingKey, StringComparison.Ordinal))
                     {
                         return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                     }
@@ -300,12 +284,13 @@ namespace SerialPortService.Services
                     // 步骤2：创建或复用 GenericHandler<T>。
                     // 为什么：复用通用并发、重试、告警和指标能力。
                     // 风险点：若复用了错误上下文，会导致解析错位或请求匹配失败。
-                    context = ports.GetOrAdd(portName, _ => new GenericHandler<T>(portName, baudRate, parity, dataBits, stopBits, parser, _loggerFactory.CreateLogger<GenericHandler<T>>(), _contextFactory.CreateTaggedOptions(HandleEnum.Default, ProtocolEnum.Default)));
-                    if (portBindings.TryGetValue(portName, out var currentBinding) && currentBinding != expected)
+                    context = _ports.GetOrAdd(portName, _ => CreateCustomParserContext(portName, baudRate, parity, dataBits, stopBits, parserFactory, parser));
+                    if (_portBindings.TryGetValue(portName, out var currentBinding)
+                        && !string.Equals(currentBinding.BindingKey, expected.BindingKey, StringComparison.Ordinal))
                     {
                         return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
                     }
-                    portBindings.TryAdd(portName, expected);
+                    _portBindings.TryAdd(portName, expected);
                 }
 
                 // 步骤3：在锁外异步打开上下文。
@@ -333,7 +318,7 @@ namespace SerialPortService.Services
             // 步骤1：采用异常语义执行发送。
             // 为什么：对“必须成功发送”的调用方，异常更直接。
             // 风险点：业务层若未捕获异常，可能中断当前流程。
-            if (ports.TryGetValue(portName, out var context))
+            if (_ports.TryGetValue(portName, out var context))
             {
                 return await context.Send(data).ConfigureAwait(false);
 
@@ -361,7 +346,7 @@ namespace SerialPortService.Services
                 return new OperateResult<byte[]>(false, "发送数据不能为空", -1);
             }
 
-            if (!ports.TryGetValue(portName, out var context))
+            if (!_ports.TryGetValue(portName, out var context))
             {
                 return new OperateResult<byte[]>(false, $"串口 {portName} 未打开", -1);
             }
@@ -391,21 +376,16 @@ namespace SerialPortService.Services
         public async Task<OperateResult> ClosePortAsync(string portName)
         {
             IPortContext? context;
-            PortBinding? bindingSnapshot = null;
 
             // 步骤1：原子化摘除（防止后续 50ms 的采集任务还能拿到这个句柄）
-            lock (portOpenCloseLock)
+            lock (_portOpenCloseLock)
             {
-                if (!ports.TryRemove(portName, out context))
+                if (!_ports.TryRemove(portName, out context))
                 {
                     return new OperateResult(false, $"未找到串口 {portName}", -1);
                 }
 
-                if (portBindings.TryGetValue(portName, out var binding))
-                {
-                    bindingSnapshot = binding;
-                }
-                portBindings.TryRemove(portName, out _);
+                _portBindings.TryRemove(portName, out _);
             }
 
             // 步骤2：强制执行物理关闭（移出 UI 线程防止界面卡死）
@@ -476,23 +456,23 @@ namespace SerialPortService.Services
         public OperateResult CloseAll()
         {
             List<(string PortName, IPortContext Context)> contextsToClose;
-            lock (portOpenCloseLock)
+            lock (_portOpenCloseLock)
             {
                 // 步骤1：快照当前端口并逐个关闭。
                 // 为什么：避免遍历期间字典变化影响关闭流程。
                 // 风险点：并发修改时若无快照，可能遗漏或重复关闭。
-                var portNames = ports.Keys.ToList();
+                var portNames = _ports.Keys.ToList();
                 contextsToClose = new List<(string PortName, IPortContext Context)>(portNames.Count);
 
                 foreach (var portName in portNames)
                 {
-                    if (!ports.TryRemove(portName, out var context))
+                    if (!_ports.TryRemove(portName, out var context))
                         continue;
 
                     // 步骤2：同步清理绑定状态。
                     // 为什么：保持端口上下文与绑定快照的一致性。
                     // 风险点：状态不一致会影响后续 IsOpen/OpenPort 判断。
-                    portBindings.TryRemove(portName, out _);
+                    _portBindings.TryRemove(portName, out _);
 
                     contextsToClose.Add((portName, context));
                 }
@@ -549,19 +529,19 @@ namespace SerialPortService.Services
         public async Task<OperateResult> CloseAllAsync()
         {
             List<(string PortName, IPortContext Context)> contextsToClose;
-            lock (portOpenCloseLock)
+            lock (_portOpenCloseLock)
             {
                 // 步骤1：快照当前端口并原子摘除。
                 // 为什么：避免遍历期间字典变化影响关闭流程。
                 // 风险点：并发修改时若无快照，可能遗漏或重复关闭。
-                var portNames = ports.Keys.ToList();
+                var portNames = _ports.Keys.ToList();
                 contextsToClose = new List<(string PortName, IPortContext Context)>(portNames.Count);
 
                 foreach (var portName in portNames)
                 {
-                    if (!ports.TryRemove(portName, out var ctx))
+                    if (!_ports.TryRemove(portName, out var ctx))
                         continue;
-                    portBindings.TryRemove(portName, out _);
+                    _portBindings.TryRemove(portName, out _);
                     contextsToClose.Add((portName, ctx));
                 }
 
@@ -618,14 +598,20 @@ namespace SerialPortService.Services
         /// </summary>
         public bool TryGetContext(string portName, out IPortContext? context)
         {
-            return ports.TryGetValue(portName, out context);
+            return _ports.TryGetValue(portName, out context);
         }
 
-        /// <summary>
-        /// 注册设备处理器工厂。
-        /// </summary>
-        public bool RegisterHandlerFactory(HandleEnum handleEnum, ISerialPortService.PortContextFactory factory)
-            => _contextFactory.RegisterHandlerFactory(handleEnum, factory);
+        public ContextRegistrationResult RegisterContextRegistration(string key, IPortContextRegistration registration)
+            => _contextFactory.RegisterContextRegistration(key, registration);
+
+        public ParserRegistrationResult RegisterParser<T>(ProtocolEnum protocol, string key, Func<IStreamParser<T>> factory) where T : class
+            => _parserRegistry.Register(protocol, key, factory);
+
+        public ProtocolDefinitionRegistrationResult RegisterProtocolDefinition<TPacket>(string key, IProtocolDefinition<TPacket> definition) where TPacket : class
+            => _protocolDefinitions.Register(key, definition);
+
+        public bool TryGetProtocolDefinition<TPacket>(ProtocolEnum protocol, out IProtocolDefinition<TPacket>? definition) where TPacket : class
+            => _protocolDefinitions.TryGet(protocol, out definition);
 
         /// <summary>
         /// 设置设备协议解析函数。
@@ -638,7 +624,108 @@ namespace SerialPortService.Services
         /// </summary>
         /// <param name="portName"></param>
         /// <returns></returns>
-        public bool IsOpen(string portName) => ports.ContainsKey(portName);
+        public bool IsOpen(string portName) => _ports.ContainsKey(portName);
+
+        public ServiceHealthSnapshot GetHealthSnapshot()
+        {
+            var snapshots = _ports.Values
+                .OfType<IPortRuntimeDiagnostics>()
+                .Select(x => x.GetRuntimeSnapshot())
+                .OrderBy(x => x.PortName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            return new ServiceHealthSnapshot(
+                _ports.Count,
+                snapshots.Count(x => x.IsRunning),
+                snapshots.Count(x => !x.LastCloseSucceeded || x.CloseState is PortCloseState.Faulted or PortCloseState.TimedOut),
+                snapshots);
+        }
+
+        public ServiceDiagnosticReport GetDiagnosticReport(int maxItems = 20)
+        {
+            if (maxItems <= 0)
+            {
+                maxItems = 20;
+            }
+
+            var health = GetHealthSnapshot();
+            var recentErrors = health.Ports
+                .SelectMany(x => x.RecentErrors)
+                .OrderByDescending(x => x.UtcTicks)
+                .Take(maxItems)
+                .ToList();
+
+            var recentEvents = health.Ports
+                .SelectMany(x => x.RecentEvents)
+                .OrderByDescending(x => x.UtcTicks)
+                .Take(maxItems)
+                .ToList();
+
+            return new ServiceDiagnosticReport(
+                health.HealthStatus,
+                health.OpenPortCount,
+                health.RunningPortCount,
+                health.FaultedPortCount,
+                recentErrors,
+                recentEvents);
+        }
+
+        public PortRuntimeSnapshotResult GetPortRuntimeSnapshot(string portName)
+        {
+            if (string.IsNullOrWhiteSpace(portName))
+            {
+                return new PortRuntimeSnapshotResult(false, "串口名不能为空");
+            }
+
+            if (!_ports.TryGetValue(portName, out var context))
+            {
+                return new PortRuntimeSnapshotResult(false, $"未找到串口 {portName}");
+            }
+
+            if (context is not IPortRuntimeDiagnostics diagnostics)
+            {
+                return new PortRuntimeSnapshotResult(false, $"串口 {portName} 不支持运行时诊断");
+            }
+
+            return new PortRuntimeSnapshotResult(true, "获取成功", diagnostics.GetRuntimeSnapshot());
+        }
+
+        public async Task<OperateResult> RestartPortAsync(string portName)
+        {
+            if (string.IsNullOrWhiteSpace(portName))
+            {
+                return new OperateResult(false, "串口名不能为空", -1);
+            }
+
+            if (!_portBindings.TryGetValue(portName, out var binding))
+            {
+                return new OperateResult(false, $"未找到串口 {portName} 的打开参数", -1);
+            }
+
+            var closeResult = await ClosePortAsync(portName).ConfigureAwait(false);
+            if (!closeResult.IsSuccess)
+            {
+                return new OperateResult(false, $"重启失败，关闭阶段失败：{closeResult.Message}", closeResult.ErrorCode);
+            }
+
+            return await ReopenBindingAsync(portName, binding).ConfigureAwait(false);
+        }
+
+        public async Task<BatchPortOperationResult> RestartPortsAsync(IEnumerable<string> portNames)
+        {
+            ArgumentNullException.ThrowIfNull(portNames);
+
+            var results = new List<OperateResult>();
+            foreach (var portName in portNames.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                results.Add(await RestartPortAsync(portName).ConfigureAwait(false));
+            }
+
+            return new BatchPortOperationResult(
+                results.Count(x => x.IsSuccess),
+                results.Count(x => !x.IsSuccess),
+                results);
+        }
 
         /// <summary>
         /// 刷新串口
@@ -651,6 +738,99 @@ namespace SerialPortService.Services
             oldPortNames = oldPortNames.Intersect(current).ToList();
             oldPortNames.AddRange(current.Except(oldPortNames));
         }
+
+        private async Task<OperateResult> ReopenBindingAsync(string portName, PortBinding binding)
+        {
+            try
+            {
+                IPortContext context;
+                lock (_portOpenCloseLock)
+                {
+                    context = _ports.GetOrAdd(portName, _ => binding.ContextFactory());
+                    if (_portBindings.TryGetValue(portName, out var currentBinding)
+                        && !string.Equals(currentBinding.BindingKey, binding.BindingKey, StringComparison.Ordinal))
+                    {
+                        return new OperateResult(false, $"串口 {portName} 已按不同参数打开，请先关闭再重新打开", -1);
+                    }
+
+                    _portBindings.TryAdd(portName, binding);
+                }
+
+                await context.OpenAsync().ConfigureAwait(false);
+                return new OperateResult(true, $"串口 {portName} 重启成功", 0);
+            }
+            catch (Exception ex)
+            {
+                lock (_portOpenCloseLock)
+                {
+                    _ports.TryRemove(portName, out _);
+                    _portBindings.TryRemove(portName, out _);
+                }
+
+                return new OperateResult(false, $"重启失败，重开阶段失败：{ex.Message}", -1);
+            }
+        }
+
+        private PortBinding CreateBuiltInBinding(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, HandleEnum handleEnum, ProtocolEnum protocol)
+            => new(
+                baudRate,
+                parity,
+                dataBits,
+                stopBits,
+                handleEnum,
+                protocol,
+                BuildBindingKey(baudRate, parity, dataBits, stopBits, handleEnum, protocol, parserDescription: null),
+                () => _contextFactory.Create(portName, baudRate, parity, dataBits, stopBits, handleEnum, protocol).Context);
+
+        private PortBinding CreateCustomBinding<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, Func<IStreamParser<T>> parserFactory, IStreamParser<T> parser) where T : class
+        {
+            var parserDescription = parser.GetType().AssemblyQualifiedName ?? parser.GetType().FullName ?? typeof(T).FullName ?? typeof(T).Name;
+            return new PortBinding(
+                baudRate,
+                parity,
+                dataBits,
+                stopBits,
+                HandleEnum.Default,
+                ProtocolEnum.Default,
+                BuildBindingKey(baudRate, parity, dataBits, stopBits, HandleEnum.Default, ProtocolEnum.Default, parserDescription),
+                () => CreateCustomParserContext(portName, baudRate, parity, dataBits, stopBits, parserFactory),
+                parserDescription);
+        }
+
+        protected virtual IPortContext CreateCustomParserContext<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, Func<IStreamParser<T>> parserFactory, IStreamParser<T>? parser = null) where T : class
+            => CreateGenericHandler(portName, baudRate, parity, dataBits, stopBits, parserFactory, parser);
+
+        private GenericHandler<T> CreateGenericHandler<T>(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, Func<IStreamParser<T>> parserFactory, IStreamParser<T>? parser = null) where T : class
+            => new(
+                portName,
+                baudRate,
+                parity,
+                dataBits,
+                stopBits,
+                parser ?? CreateParser(parserFactory),
+                _loggerFactory.CreateLogger<GenericHandler<T>>(),
+                _contextFactory.CreateTaggedOptions(HandleEnum.Default, ProtocolEnum.Default));
+
+        private static IStreamParser<T> CreateParser<T>(Func<IStreamParser<T>> parserFactory) where T : class
+        {
+            var parser = parserFactory();
+            ArgumentNullException.ThrowIfNull(parser);
+            parser.Reset();
+            return parser;
+        }
+
+        private static Func<IStreamParser<T>> CreateReusableParserFactory<T>(IStreamParser<T> parser) where T : class
+        {
+            ArgumentNullException.ThrowIfNull(parser);
+            return () =>
+            {
+                parser.Reset();
+                return parser;
+            };
+        }
+
+        private static string BuildBindingKey(int baudRate, Parity parity, int dataBits, StopBits stopBits, HandleEnum handleEnum, ProtocolEnum protocol, string? parserDescription)
+            => FormattableString.Invariant($"{baudRate}|{(int)parity}|{dataBits}|{(int)stopBits}|{(int)handleEnum}|{(int)protocol}|{parserDescription ?? string.Empty}");
 
         /// <summary>
         /// 释放服务持有的全部串口资源。

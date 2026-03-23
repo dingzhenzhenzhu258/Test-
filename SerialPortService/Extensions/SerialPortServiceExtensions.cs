@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using SerialPortService.Options;
 using SerialPortService.Services;
 using SerialPortService.Services.Interfaces;
 using SerialPortService.Services.Handler;
@@ -29,6 +30,7 @@ namespace SerialPortService.Extensions
             // 为什么：保证即使没有外部配置，也有一组可运行默认值。
             // 风险点：未注册 options 时，服务构造可能拿不到配置导致行为不可预测。
             services.TryAddSingleton(new GenericHandlerOptions());
+            services.TryAddSingleton(new RequestDefaultsOptions());
 
             // 步骤3：注册串口服务实现。
             // 为什么：业务层通过接口解耦具体实现。
@@ -41,6 +43,7 @@ namespace SerialPortService.Extensions
         /// 从配置中读取 <see cref="GenericHandlerOptions"/> 相关选项时使用的节路径。
         /// </summary>
         private const string GenericHandlerOptionsSection = "SerialPortService:GenericHandlerOptions";
+        private const string RequestDefaultsSection = "SerialPortService:RequestDefaults";
 
         /// <summary>
         /// 基于配置注册串口服务，并对关键参数执行安全归一化。
@@ -61,7 +64,15 @@ namespace SerialPortService.Extensions
             // 风险点：直接使用原始配置会把非法值传入运行期。
             var defaults = new GenericHandlerOptions();
             var rawOptions = new GenericHandlerOptions();
-            configuration.GetSection("SerialPortService:GenericHandlerOptions").Bind(rawOptions);
+
+            // 步骤2.1：仅读取当前标准配置节。
+            // 为什么：统一配置模型，避免运行期继续保留历史分支。
+            // 风险点：若新旧节名并存，排障时很难判断实际生效来源。
+            var standardSection = configuration.GetSection(GenericHandlerOptionsSection);
+            if (standardSection.Exists())
+            {
+                standardSection.Bind(rawOptions);
+            }
 
             // 步骤3：归一化配置。
             // 为什么：统一把非法/越界值回退到默认值，降低运行时故障概率。
@@ -73,6 +84,15 @@ namespace SerialPortService.Extensions
                 DropWhenNoActiveRequest = rawOptions.DropWhenNoActiveRequest,
                 ResponseChannelFullMode = rawOptions.ResponseChannelFullMode,
                 WaitModeQueueCapacity = rawOptions.WaitModeQueueCapacity > 0 ? rawOptions.WaitModeQueueCapacity : defaults.WaitModeQueueCapacity,
+                SendChannelCapacity = rawOptions.SendChannelCapacity > 0 ? rawOptions.SendChannelCapacity : defaults.SendChannelCapacity,
+                RawInputChannelCapacity = rawOptions.RawInputChannelCapacity > 0 ? rawOptions.RawInputChannelCapacity : defaults.RawInputChannelCapacity,
+                RawReadBufferSize = rawOptions.RawReadBufferSize > 0 ? rawOptions.RawReadBufferSize : defaults.RawReadBufferSize,
+                SerialPortReadBufferSize = rawOptions.SerialPortReadBufferSize > 0 ? rawOptions.SerialPortReadBufferSize : defaults.SerialPortReadBufferSize,
+                EnableRawReadChunkLog = rawOptions.EnableRawReadChunkLog,
+                RawBytesLogIntervalSeconds = rawOptions.RawBytesLogIntervalSeconds > 0 ? rawOptions.RawBytesLogIntervalSeconds : defaults.RawBytesLogIntervalSeconds,
+                DispatchParsedEventAsync = rawOptions.DispatchParsedEventAsync,
+                ParsedEventChannelCapacity = rawOptions.ParsedEventChannelCapacity > 0 ? rawOptions.ParsedEventChannelCapacity : defaults.ParsedEventChannelCapacity,
+                ParsedEventChannelFullMode = rawOptions.ParsedEventChannelFullMode,
                 ProtocolTag = rawOptions.ProtocolTag,
                 DeviceTypeTag = rawOptions.DeviceTypeTag,
                 ReconnectIntervalMs = rawOptions.ReconnectIntervalMs > 0 ? rawOptions.ReconnectIntervalMs : defaults.ReconnectIntervalMs,
@@ -94,10 +114,22 @@ namespace SerialPortService.Extensions
                     : defaults.ReconnectFailureRateAlertMinSamples
             };
 
+            // 步骤3.1：绑定主动请求默认参数。
+            // 为什么：让 Modbus 等请求-响应客户端不再依赖分散硬编码。
+            // 风险点：若缺少统一默认值，不同业务侧会出现超时和重试策略漂移。
+            var rawRequestDefaults = new RequestDefaultsOptions();
+            configuration.GetSection(RequestDefaultsSection).Bind(rawRequestDefaults);
+            var requestDefaults = new RequestDefaultsOptions
+            {
+                TimeoutMs = rawRequestDefaults.TimeoutMs > 0 ? rawRequestDefaults.TimeoutMs : 1000,
+                RetryCount = rawRequestDefaults.RetryCount >= 0 ? rawRequestDefaults.RetryCount : 3
+            };
+
             // 步骤4：覆盖已注册 options。
             // 为什么：显式配置应优先于默认注册。
             // 风险点：若仅 TryAdd，会导致“配置存在但不生效”的隐蔽问题。
             services.Replace(ServiceDescriptor.Singleton(options));
+            services.Replace(ServiceDescriptor.Singleton(requestDefaults));
 
             // 步骤5：注册串口服务实现。
             // 为什么：确保调用方通过接口可解析到统一服务。

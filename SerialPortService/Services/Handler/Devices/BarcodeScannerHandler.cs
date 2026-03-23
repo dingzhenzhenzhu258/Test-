@@ -18,8 +18,8 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 创建扫码枪处理器。
         /// </summary>
-        public BarcodeScannerHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
-            : base(portName, baudRate, parity, dataBits, stopBits, new BarcodeParser(), logger)
+        public BarcodeScannerHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger, GenericHandlerOptions? options = null)
+            : base(portName, baudRate, parity, dataBits, stopBits, new BarcodeParser(), logger, options)
         {
             // 步骤1：沿用基类初始化串口管线。
             // 为什么：扫码场景无需额外构造逻辑。

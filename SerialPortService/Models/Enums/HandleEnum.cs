@@ -31,6 +31,11 @@ namespace SerialPortService.Models.Enums
         ServoMotor,
 
         /// <summary>
+        /// 自定义协议设备类型。
+        /// </summary>
+        CustomProtocol,
+
+        /// <summary>
         /// 默认或通用设备类型。
         /// </summary>
         Default

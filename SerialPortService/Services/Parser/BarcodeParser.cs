@@ -1,6 +1,7 @@
 ﻿﻿using SerialPortService.Services.Interfaces;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 
 namespace SerialPortService.Services.Parser
 {
@@ -19,7 +20,7 @@ namespace SerialPortService.Services.Parser
         /// <summary>
         /// 逐字节尝试解析扫码枪文本流。
         /// </summary>
-        public bool TryParse(byte b, out string result)
+        public bool TryParse(byte b, [NotNullWhen(true)] out string? result)
         {
             // 步骤2：将输入字节转为字符。
             // 为什么：扫码枪通常按 ASCII 文本流输出。

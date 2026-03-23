@@ -47,7 +47,7 @@ namespace Test_High_speed_acquisition
 
                 // App Host
                 services.AddHostedService<ApplicationHostService>();
-                services.AddHostedService<UnimplementedUserService>();
+                services.AddHostedService<ApplicationWarmupService>();
 
                 // Messenger
                 services.AddSingleton<WeakReferenceMessenger>();
@@ -72,6 +72,7 @@ namespace Test_High_speed_acquisition
 
                 // 注册 Dispatcher 以便在 ViewModel 中使用它来执行 UI 线程上的操作
                 services.AddSingleton(_ => Current.Dispatcher);
+                services.AddSingleton<ModbusPersistenceService>();
 
                 services.AddSingleton<MainWindow>(sp => new MainWindow { DataContext = sp.GetRequiredService<MainWindowViewModel>() });
                 services.AddSingleton<MainWindowViewModel>();

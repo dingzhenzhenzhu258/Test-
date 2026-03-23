@@ -5,16 +5,20 @@ using SerialPortService.Models;
 using SerialPortService.Models.Enums;
 using SerialPortService.Services.Handler;
 using SerialPortService.Services.Interfaces;
+using SerialPortService.Services;
 using System.Diagnostics;
 using System.Collections.ObjectModel;
+using System.IO;
 using System.IO.Ports;
 using System.Linq;
 using System.Text;
 using System.Threading.Channels;
 using System.Windows.Threading;
+using Test_High_speed_acquisition.Services;
 using Test_High_speed_acquisition.ViewModels.Models;
 using Microsoft.Extensions.Logging;
 using Logger.Helpers;
+using Newtonsoft.Json;
 
 namespace Test_High_speed_acquisition.ViewModels.Windows
 {
@@ -37,6 +41,8 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         private readonly Channel<string> _uiLines;
         private readonly DispatcherTimer _uiFlushTimer;
         private readonly StringBuilder _receivedDataBuffer = new(130_000);
+        private readonly ModbusPersistenceService _persistenceService;
+        private IPortRuntimeDiagnostics? _runtimeDiagnostics;
         private long _totalSendCount;
         private long _totalReceiveCount;
         private long _segmentSendCount;
@@ -47,11 +53,13 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         private const int PersistBatchSize = 200;
         private const int PersistBatchWindowMs = 500;
         private const int DiagnosticIntervalMs = 5000;
+        private const int TrafficLogSampleInterval = 100;
 
-        public MainWindowViewModel(ISerialPortService serialPortService, Dispatcher dispatcher, ILogger<MainWindowViewModel> logger)
+        public MainWindowViewModel(ISerialPortService serialPortService, Dispatcher dispatcher, ILogger<MainWindowViewModel> logger, ModbusPersistenceService persistenceService)
         {
             _serialPortService = serialPortService;
             _dispatcher = dispatcher;
+            _persistenceService = persistenceService;
 
             _uiLines = Channel.CreateBounded<string>(new BoundedChannelOptions(4096)
             {
@@ -148,8 +156,7 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
 
         private Task PersistBatchAsync(List<ModbusPacket> batch, CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Persist batch size={BatchSize}", batch.Count);
-            return Task.CompletedTask;
+            return _persistenceService.PersistBatchAsync(batch, cancellationToken);
         }
 
         private async Task DiagnosticLoopAsync(CancellationToken cancellationToken)
@@ -159,6 +166,7 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 try
                 {
                     await Task.Delay(DiagnosticIntervalMs, cancellationToken).ConfigureAwait(false);
+                    RefreshHealthSummary();
 
                     var memoryMb = GC.GetTotalMemory(false) / 1024d / 1024d;
                     var threadCount = Process.GetCurrentProcess().Threads.Count;
@@ -169,12 +177,13 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                     if (_modbusContext is ModbusHandler handler)
                     {
                         var metrics = handler.GetMetrics();
-                        var parsedDrop = handler.GetParsedPacketDropCount();
-                        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG waitBacklog={metrics.WaitBacklog}, parsedPacketDrop={parsedDrop}, mem={memoryMb:F1}MB, threads={threadCount}, gc={gc0}/{gc1}/{gc2}");
+                        var runtime = _runtimeDiagnostics?.GetRuntimeSnapshot();
+                        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG waitBacklog={metrics.WaitBacklog}, parsedPacketDrop={metrics.ParsedEventDropCount}, rawBytes={runtime?.RawBytesTotal ?? 0}, reconnectExhausted={runtime?.ReconnectExhaustedCount ?? 0}, persistPackets={_persistenceService.PersistedPacketCount}, persistFail={_persistenceService.PersistFailureCount}, mem={memoryMb:F1}MB, threads={threadCount}, gc={gc0}/{gc1}/{gc2}");
                     }
                     else
                     {
-                        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG mem={memoryMb:F1}MB, threads={threadCount}, gc={gc0}/{gc1}/{gc2}");
+                        var runtime = _runtimeDiagnostics?.GetRuntimeSnapshot();
+                        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG rawBytes={runtime?.RawBytesTotal ?? 0}, reconnectExhausted={runtime?.ReconnectExhaustedCount ?? 0}, persistPackets={_persistenceService.PersistedPacketCount}, persistFail={_persistenceService.PersistFailureCount}, mem={memoryMb:F1}MB, threads={threadCount}, gc={gc0}/{gc1}/{gc2}");
                     }
                 }
                 catch (OperationCanceledException ex)
@@ -231,6 +240,15 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
 
         [ObservableProperty]
         private string statusMessage = "未连接";
+
+        [ObservableProperty]
+        private string healthSummary = "无诊断数据";
+
+        [ObservableProperty]
+        private string lastDiagnosticExportPath = string.Empty;
+
+        [ObservableProperty]
+        private string recentDiagnostics = "无最近错误";
 
         /// <summary>
         /// 是否允许打开串口。
@@ -304,7 +322,7 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                     return;
                 }
 
-                var result = _serialPortService.OpenPort(SelectedPort, BaudRate, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
+                var result = await _serialPortService.OpenPortAsync(SelectedPort, BaudRate, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
                 StatusMessage = result.Message ?? string.Empty;
 
                 if (!result.IsSuccess)
@@ -315,7 +333,9 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
                 if (_serialPortService.TryGetContext(SelectedPort, out var ctx) && ctx is IModbusContext modbus)
                 {
                     _modbusContext = modbus;
+                    _runtimeDiagnostics = ctx as IPortRuntimeDiagnostics;
                     IsPortOpened = true;
+                    RefreshHealthSummary();
                     UpdateStatusMessage();
                     return;
                 }
@@ -350,9 +370,76 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             if (result.IsSuccess)
             {
                 _modbusContext = null;
+                _runtimeDiagnostics = null;
                 IsPortOpened = false;
+                HealthSummary = "无诊断数据";
             }
             StatusMessage = result.Message ?? string.Empty;
+        }
+
+        [RelayCommand(CanExecute = nameof(CanClosePort))]
+        private async Task RestartPortAsync()
+        {
+            if (string.IsNullOrWhiteSpace(SelectedPort))
+            {
+                return;
+            }
+
+            if (IsAcquiring)
+            {
+                await StopAcquisitionAsync();
+            }
+
+            var result = await _serialPortService.RestartPortAsync(SelectedPort);
+            StatusMessage = result.Message ?? string.Empty;
+            if (!result.IsSuccess)
+            {
+                return;
+            }
+
+            if (_serialPortService.TryGetContext(SelectedPort, out var ctx) && ctx is IModbusContext modbus)
+            {
+                _modbusContext = modbus;
+                _runtimeDiagnostics = ctx as IPortRuntimeDiagnostics;
+                IsPortOpened = true;
+                RefreshHealthSummary();
+                UpdateStatusMessage();
+            }
+        }
+
+        [RelayCommand]
+        private void RefreshHealth()
+        {
+            RefreshHealthSummary();
+            UpdateStatusMessage();
+        }
+
+        [RelayCommand]
+        private void ExportDiagnostics()
+        {
+            object? portSnapshot = string.IsNullOrWhiteSpace(SelectedPort)
+                ? null
+                : _serialPortService.GetPortRuntimeSnapshot(SelectedPort);
+            var report = _serialPortService.GetDiagnosticReport();
+
+            var payload = new
+            {
+                ExportedAt = DateTimeOffset.Now,
+                SelectedPort,
+                StatusMessage,
+                HealthSummary,
+                RecentDiagnostics,
+                ServiceHealth = _serialPortService.GetHealthSnapshot(),
+                ServiceDiagnostics = report,
+                PortSnapshot = portSnapshot
+            };
+
+            var fileName = $"serialport-diagnostics-{DateTime.Now:yyyyMMdd-HHmmss}.json";
+            var outputPath = Path.Combine(AppContext.BaseDirectory, fileName);
+            var json = JsonConvert.SerializeObject(payload, Formatting.Indented);
+            File.WriteAllText(outputPath, json, Encoding.UTF8);
+            LastDiagnosticExportPath = outputPath;
+            _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] DIAG-EXPORT: {outputPath}");
         }
 
         [RelayCommand(CanExecute = nameof(CanStartAcquisition))]
@@ -514,98 +601,54 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         /// </summary>
         private async Task SendLoopAsync(IModbusContext modbus, CancellationToken cancellationToken)
         {
-            //while (!cancellationToken.IsCancellationRequested)
-            //{
-            //    // 步骤1：记录本轮开始时间。
-            //    // 为什么：用于实现“任意 ms 配置”的精确轮询节奏。
-            //    // 风险点：仅使用固定 Delay 会叠加处理时间，实际周期会漂移。
-            //    var cycleWatch = Stopwatch.StartNew();
-
-            //    // 步骤2：构建并发送读取命令。
-            //    // 为什么：统一走 Modbus 请求-响应闭环，避免高频盲发。
-            //    // 风险点：若并行发送或不等响应，易出现回包串台与丢包。
-            //    var command = BuildReadCommand();
-            //    var txHex = BitConverter.ToString(command);
-            //    Interlocked.Increment(ref _totalSendCount);
-            //    Interlocked.Increment(ref _segmentSendCount);
-            //    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX: {txHex}");
-            //    _logger.AddLog(LogLevel.Information, "发送命令: {Command}", args: new object[] { txHex });
-            //    try
-            //    {
-            //        // 步骤3：等待匹配响应（同步轮询核心）。
-            //        // 为什么：确保一问一答，杜绝 20ms 高频下的“只发不收”。
-            //        // 风险点：超时参数过小会频繁超时，过大则降低吞吐。
-            //        var packet = await modbus.SendRequestAsync(command, timeout: 3000, retryCount: 1, cancellationToken).ConfigureAwait(false);
-            //        var index = Interlocked.Increment(ref _totalReceiveCount);
-            //        Interlocked.Increment(ref _segmentReceiveCount);
-            //        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] #{index} RX: {BitConverter.ToString(packet.RawFrame)}");
-            //        _logger.AddLog(LogLevel.Information, "接收响应: {Response}", args: new object[] { BitConverter.ToString(packet.RawFrame) });
-            //    }
-            //    catch (OperationCanceledException)
-            //    {
-            //        break;
-            //    }
-            //    catch (Exception ex)
-            //    {
-            //        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
-            //        _logger.AddLog(LogLevel.Error, "发送循环接收响应失败，Command={Command}", exception: ex, args: txHex);
-            //    }
-
-            //    // 步骤4：按配置补齐剩余周期，支持任意 ms（含 0ms）。
-            //    // 为什么：当响应快于周期时保持固定节奏；响应慢于周期时立即下一轮。
-            //    // 风险点：不扣除处理耗时会导致实际周期 > 配置值。
-            //    cycleWatch.Stop();
-            //    var remainingMs = PollIntervalMs - (int)cycleWatch.ElapsedMilliseconds;
-            //    if (remainingMs > 0)
-            //    {
-            //        await Task.Delay(remainingMs, cancellationToken).ConfigureAwait(false);
-            //    }
-            //}
-
-            // 步骤1：记录本轮开始时间。
-            // 为什么：用于实现“任意 ms 配置”的精确轮询节奏。
-            // 风险点：仅使用固定 Delay 会叠加处理时间，实际周期会漂移。
-            var cycleWatch = Stopwatch.StartNew();
-
-            // 步骤2：构建并发送读取命令。
-            // 为什么：统一走 Modbus 请求-响应闭环，避免高频盲发。
-            // 风险点：若并行发送或不等响应，易出现回包串台与丢包。
-            var command = BuildReadCommand();
-            var txHex = BitConverter.ToString(command);
-            Interlocked.Increment(ref _totalSendCount);
-            Interlocked.Increment(ref _segmentSendCount);
-            _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX: {txHex}");
-            _logger.AddLog(LogLevel.Information, "发送命令: {Command}", args: new object[] { txHex });
-            try
+            while (!cancellationToken.IsCancellationRequested)
             {
-                // 步骤3：等待匹配响应（同步轮询核心）。
-                // 为什么：确保一问一答，杜绝 20ms 高频下的“只发不收”。
-                // 风险点：超时参数过小会频繁超时，过大则降低吞吐。
-                var packet = await modbus.SendRequestAsync(command, timeout: 3000, retryCount: 1, cancellationToken).ConfigureAwait(false);
-                var index = Interlocked.Increment(ref _totalReceiveCount);
-                Interlocked.Increment(ref _segmentReceiveCount);
-                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] #{index} RX: {BitConverter.ToString(packet.RawFrame)}");
-                _logger.AddLog(LogLevel.Information, "接收响应: {Response}", args: new object[] { BitConverter.ToString(packet.RawFrame) });
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
-                _logger.AddLog(LogLevel.Error, "发送循环接收响应失败，Command={Command}", exception: ex, args: txHex);
-            }
+                var cycleWatch = Stopwatch.StartNew();
+                var command = BuildReadCommand();
+                var txHex = BitConverter.ToString(command);
+                var sendIndex = Interlocked.Increment(ref _totalSendCount);
+                Interlocked.Increment(ref _segmentSendCount);
 
-            // 步骤4：按配置补齐剩余周期，支持任意 ms（含 0ms）。
-            // 为什么：当响应快于周期时保持固定节奏；响应慢于周期时立即下一轮。
-            // 风险点：不扣除处理耗时会导致实际周期 > 配置值。
-            cycleWatch.Stop();
-            var remainingMs = PollIntervalMs - (int)cycleWatch.ElapsedMilliseconds;
-            if (remainingMs > 0)
-            {
-                await Task.Delay(remainingMs, cancellationToken).ConfigureAwait(false);
+                if (ShouldSampleTraffic(sendIndex))
+                {
+                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX#{sendIndex}: {txHex}");
+                    _logger.AddLog(LogLevel.Information, "发送命令 #{Index}: {Command}", args: new object[] { sendIndex, txHex });
+                }
+
+                try
+                {
+                    var packet = await modbus.SendRequestAsync(command, timeout: 3000, retryCount: 1, cancellationToken).ConfigureAwait(false);
+                    var receiveIndex = Interlocked.Increment(ref _totalReceiveCount);
+                    Interlocked.Increment(ref _segmentReceiveCount);
+
+                    if (ShouldSampleTraffic(receiveIndex))
+                    {
+                        var responseHex = BitConverter.ToString(packet.RawFrame);
+                        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX#{receiveIndex}: {responseHex}");
+                        _logger.AddLog(LogLevel.Information, "接收响应 #{Index}: {Response}", args: new object[] { receiveIndex, responseHex });
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
+                    _logger.AddLog(LogLevel.Error, "发送循环接收响应失败，Command={Command}", exception: ex, args: txHex);
+                }
+
+                cycleWatch.Stop();
+                var remainingMs = PollIntervalMs - (int)cycleWatch.ElapsedMilliseconds;
+                if (remainingMs > 0)
+                {
+                    await Task.Delay(remainingMs, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
+
+        private static bool ShouldSampleTraffic(long count)
+            => count <= 5 || count % TrafficLogSampleInterval == 0;
 
         private void UpdateStatusMessage()
         {
@@ -623,6 +666,38 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
             var runningText = IsAcquiring ? "采集中" : "已停止";
 
             StatusMessage = $"{segmentText}{runningText} | 总发送={totalSend} 总接收={totalReceive} | 本段发送={segmentSend} 本段接收={segmentReceive}";
+        }
+
+        private void RefreshHealthSummary()
+        {
+            if (string.IsNullOrWhiteSpace(SelectedPort))
+            {
+                HealthSummary = "无诊断数据";
+                RecentDiagnostics = "无最近错误";
+                return;
+            }
+
+            var portSnapshot = _serialPortService.GetPortRuntimeSnapshot(SelectedPort);
+            if (!portSnapshot.IsSuccess || portSnapshot.Snapshot is null)
+            {
+                var health = _serialPortService.GetHealthSnapshot();
+                var report = _serialPortService.GetDiagnosticReport(5);
+                HealthSummary = $"服务健康={health.HealthStatus} | 端口={health.OpenPortCount} 运行中={health.RunningPortCount} 故障={health.FaultedPortCount}";
+                RecentDiagnostics = report.RecentErrors.Count == 0
+                    ? "无最近错误"
+                    : string.Join(" | ", report.RecentErrors.Select(x => x.Message));
+                return;
+            }
+
+            var snapshot = portSnapshot.Snapshot.Value;
+            var lastError = snapshot.RecentErrors.Count > 0
+                ? snapshot.RecentErrors[^1].Message
+                : "none";
+            RecentDiagnostics = snapshot.RecentErrors.Count == 0
+                ? "无最近错误"
+                : string.Join(" | ", snapshot.RecentErrors.TakeLast(3).Select(x => x.Message));
+            HealthSummary =
+                $"健康={snapshot.HealthStatus} | 端口={snapshot.PortName} | 运行={snapshot.IsRunning} | CloseState={snapshot.CloseState} | Raw={snapshot.RawBytesTotal} | Reconnect={snapshot.ReconnectCycles}/{snapshot.ReconnectExhaustedCount} | LastReconnect={snapshot.LastReconnectReason ?? "none"} | EventDrop={snapshot.ParsedEventDropCount} | Errors={snapshot.RecentErrors.Count} | LastError={lastError}";
         }
 
         private bool ValidateCommandParameters(out string message)

@@ -1,57 +1,55 @@
 using SerialPortService.Models;
 using SerialPortService.Models.Enums;
 using SerialPortService.Services.Interfaces;
-using SerialPortService.Services.Protocols.Modbus;
 using SerialPortService.Services.Parser;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using SerialPortService.Services.Protocols.Modbus;
+using System.Collections.Concurrent;
 
 namespace SerialPortService.Services
 {
     /// <summary>
-    /// 解析器工厂：专门负责"生产"各种协议解析器
+    /// 实例级解析器注册表。
     /// </summary>
-    public static class ParserFactory
+    public sealed class ParserFactory : IParserRegistry
     {
-        /// <summary>
-        /// 根据协议枚举创建 Modbus 系列解析器。
-        /// </summary>
-        /// <param name="protocol">协议类型</param>
-        /// <returns>对应的 Modbus 解析器实例</returns>
-        public static IStreamParser<ModbusPacket> CreateModbusParser(ProtocolEnum protocol)
+        private readonly ConcurrentDictionary<(ProtocolEnum Protocol, System.Type ResultType), ParserRegistration> _registrations = new();
+
+        public ParserFactory()
         {
-            // 步骤1：按协议枚举分派解析器实现。
-            // 为什么：把协议选择逻辑集中在工厂层，调用方无需关心具体实现。
-            // 风险点：协议枚举与实现不一致时会在运行时抛出不支持异常。
-            return protocol switch
+            Register<ModbusPacket>(ProtocolEnum.ModbusRTU, "builtin_modbus_rtu", static () => new ModbusRtuParser());
+            Register<CustomFrame>(ProtocolEnum.Default, "builtin_custom_default", static () => new CustomProtocolParser());
+        }
+
+        public ParserRegistrationResult Register<T>(ProtocolEnum protocol, string key, Func<IStreamParser<T>> factory) where T : class
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(key);
+            ArgumentNullException.ThrowIfNull(factory);
+
+            var registrationKey = (protocol, typeof(T));
+            var registration = new ParserRegistration(key, factory);
+            if (_registrations.TryAdd(registrationKey, registration))
             {
-                ProtocolEnum.ModbusRTU => new ModbusRtuParser(),
+                return new ParserRegistrationResult(true, $"Parser registration '{key}' added.", key);
+            }
 
-                ProtocolEnum.ModbusASCII => throw new NotSupportedException("当前版本尚未实现 ModbusASCII 解析器，请改用 ModbusRTU 或自定义解析器"),
-
-                // 未来如果你写了 ASCII 解析器，就在这里加一行，不用改主服务代码
-                // ProtocolEnum.ModbusASCII => new ModbusAsciiParser(), 
-
-                _ => throw new NotSupportedException($"工厂无法创建协议: {protocol}. 当前仅支持: ModbusRTU")
-            };
+            var existing = _registrations[registrationKey];
+            return new ParserRegistrationResult(
+                false,
+                $"Parser registration already exists for protocol={protocol}, resultType={typeof(T).Name}.",
+                key,
+                existing.Key);
         }
 
-        /// <summary>
-        /// 创建自定义协议解析器。
-        /// </summary>
-        /// <returns>自定义协议解析器实例</returns>
-        public static IStreamParser<CustomFrame> CreateCustomProtocolParser()
+        public IStreamParser<T> Create<T>(ProtocolEnum protocol) where T : class
         {
-            // 步骤1：返回自定义协议解析器实例。
-            // 为什么：统一由工厂负责解析器创建，便于后续替换实现。
-            // 风险点：若业务直接 new 多种解析器，维护和升级成本会增加。
-            return new CustomProtocolParser();
+            if (_registrations.TryGetValue((protocol, typeof(T)), out var registration))
+            {
+                return ((Func<IStreamParser<T>>)registration.Factory)();
+            }
+
+            throw new NotSupportedException($"No parser registered for protocol={protocol}, resultType={typeof(T).Name}.");
         }
 
-        // 未来如果有其他类型的解析器，也可以加在这里
-        // public static IStreamParser<string> CreateStringParser(...) { ... }
+        private readonly record struct ParserRegistration(string Key, Delegate Factory);
     }
 }

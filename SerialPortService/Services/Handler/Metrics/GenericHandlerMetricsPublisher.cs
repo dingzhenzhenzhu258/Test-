@@ -46,6 +46,7 @@ namespace SerialPortService.Services.Handler
             Meter.CreateObservableGauge<int>("serialport.handler.active_requests", ObserveActiveRequests);
             Meter.CreateObservableGauge<long>("serialport.handler.wait_backlog", ObserveWaitBacklog);
             Meter.CreateObservableGauge<long>("serialport.handler.wait_backlog_high_watermark", ObserveWaitBacklogHighWatermark);
+            Meter.CreateObservableGauge<long>("serialport.handler.parsed_event_drop", ObserveParsedEventDropCount);
         }
 
         /// <summary>
@@ -129,6 +130,11 @@ namespace SerialPortService.Services.Handler
         /// 采样等待积压高水位。
         /// </summary>
         private static List<Measurement<long>> ObserveWaitBacklogHighWatermark() => ObserveLong(m => m.WaitBacklogHighWatermark);
+
+        /// <summary>
+        /// 采样解析事件分发通道丢弃计数。
+        /// </summary>
+        private static List<Measurement<long>> ObserveParsedEventDropCount() => ObserveLong(m => m.ParsedEventDropCount);
 
         /// <summary>
         /// 采样长整型指标并附加标签。

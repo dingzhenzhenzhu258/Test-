@@ -1,201 +1,155 @@
-# SerialPortService API 与使用说明
+# SerialPortService API Usage
 
-## 写入接口语义
+## 打开和关闭
 
-- `Write(string portName, byte[] data)`
-  - 语义：异常流。
-  - 端口未打开、发送失败、参数非法时会抛异常。
+- 推荐：`OpenPortAsync(...)`
+- 推荐：`OpenPortAsync<T>(...)`
+- 推荐：`OpenPortAsync<T>(..., Func<IStreamParser<T>> parserFactory)`
+- 推荐：`ClosePortAsync(portName)`
+- 推荐：`CloseAllAsync()`
+- 运维：`RestartPortAsync(portName)`
+- 运维：`RestartPortsAsync(portNames)`
+- 可用但不推荐作为新代码主路径：`OpenPort(...)`、`OpenPort<T>(...)`、`CloseAll()`
 
-- `TryWrite(string portName, byte[] data)`
-  - 语义：结果流。
-  - 返回 `OperateResult<byte[]>`，`IsSuccess=false` 时由业务方处理失败分支。
+同步版本仍存在，但定位是同步封装入口，不再作为“兼容模型”文档主线。
 
-## 推荐调用方式
+## 写入语义
 
-生产环境推荐：
+- `Write(portName, data)`：异常语义，失败直接抛异常
+- `TryWrite(portName, data)`：结果语义，失败返回 `OperateResult<byte[]>`
 
-1. 常规业务调用使用 `TryWrite`。
-2. 对 `IsSuccess=false` 执行统一策略（限次重试、降级、告警、审计）。
-3. 仅在需要中断流程时使用 `Write` 并捕获异常。
+生产侧优先用 `TryWrite(...)`。
 
-## 场景：主动式派发 vs 被动高频接收
+## 接口选择
 
-根据团队的 `copilot-instructions` 规范，在此明确在使用 `GenericHandler` 或特定协议（如 `ModbusHandler`）时，针对不同通信应用场景的接口选择：
+| 场景 | 推荐接口 |
+| --- | --- |
+| 主动控制，一问一答 | `SendRequestAsync(...)` |
+| 被动持续采集 | `ReadParsedPacketsAsync(...)` |
+| 只下发命令 | `TryWrite(...)` |
+| UI 轻量通知 | `OnHandleChanged` |
 
-| 场景 | 数据方向 | 推荐接口 | 不推荐接口 | 原因 |
-| --- | --- | --- | --- | --- |
-| 主动控制端 / 一问一答 | Push Request → Matched Response | `SendRequestAsync(...)` | `ReadParsedPacketsAsync(...)` | 需要超时、重试、匹配语义时，应直接复用 Handler 的请求响应能力。 |
-| 被动高频收集 / 主动上报 | Push Device Data → Pull by Stream | `ReadParsedPacketsAsync(...)` | `SendRequestAsync(...)` | 数据本身不是某次请求的响应，流式消费更自然且不会强耦合请求生命周期。 |
-| 仅发送命令，不等待匹配响应 | Push Only | `TryWrite(...)` | `Write(...)`（生产默认） | 生产建议优先结果语义，失败时走统一重试、退避和告警。 |
-| UI / 轻量通知 | Push Callback | `OnHandleChanged` | 在回调中直接长耗时处理 | 回调适合通知，不适合做重 IO、持久化或复杂聚合。 |
+## 扩展模型
 
-- **主动式控制端 (主动派发 / Push via Request)**  
-  建议使用带有明确超时重试功能的同步等待机制。  
-  **推荐 API:** `SendRequestAsync(byte[] command, int timeout = 1000, int retryCount = 3)`  
-  **适用场景:** 作为上位机控制下位机，下发开启激光、回原点、查询特定寄存器值，必须收到匹配该功能码和节点号的准确回应。
-
-- **被动高频收集 (流式推流 / Pull via Stream)**  
-  建议采用不会阻塞底层通道的流式读取机制。  
-  **推荐 API:** `ReadParsedPacketsAsync(CancellationToken cancellationToken = default)` （返回 `IAsyncEnumerable<T>`）  
-  **适用场景:** 设备主动上报状态数据（如连续高配比温度监测流或持续的测距传感器流）。业务层只需通过 `await foreach(var packet in handler.ReadParsedPacketsAsync(...))` 进行不停接收和归档即可，脱离请求/响应强绑定生命周期。  
-  *附注：当前版本的 `ModbusPacket` 已是普通对象模型，不需要也不支持 `Rent/Return`。被动推流场景只需关注消费者吞吐和后续持久化策略。*
-
-## 典型失败分支
-
-- 串口未打开：`Message` 包含“未打开”。
-- 底层发送失败：`Message` 包含“发送失败”。
-- 入参非法：`Message` 包含“不能为空”等提示。
-
-## OpenPort 约束说明
-
-- 同一个串口名重复 `OpenPort` / `OpenPortAsync` 时，若关键参数不一致（波特率、校验位、数据位、停止位、协议/解析器），库会返回失败。
-- 建议流程：`ClosePortAsync` 后再按新参数重新 `OpenPortAsync`。
-
-## 打开 / 关闭接口
-
-### 同步版本（向后兼容）
-
-- `OpenPort(...)` / `OpenPort<T>(...)`：内部通过 `Task.Run` 避免 UI 线程死锁，但仍会阻塞调用线程。
-- `CloseAll()`：同步关闭全部端口，每端口 3s 超时保护。
-
-### 异步版本（推荐）
-
-- `OpenPortAsync(...)` / `OpenPortAsync<T>(...)`：真正异步打开，不阻塞调用线程，锁外 `await` 不会长时间持锁。
-- `CloseAllAsync()`：异步关闭全部端口，每端口 3s 超时保护。
-- `ClosePortAsync(portName)`：异步关闭单个端口（3s 超时保护）。
-
-新代码建议统一使用 Async 版本。
-
-## 推荐异常处理模板
-
-1. 优先走 `TryWrite`。
-2. 失败时记录业务日志 + 设备标识 + 指令摘要。
-3. 按业务策略执行限次重试和人工告警。
-
-## 解析报文消费示例
-
-下面示例展示三种常见的解析后消费方式：
-
-1) 异步流消费（推荐用于高吞吐/可取消场景）
+### 1. 扩展设备上下文
 
 ```csharp
-// 生产建议：有界队列 + 固定 worker，避免每条报文都 Task.Run
-var cts = new CancellationTokenSource();
-var persistQueue = Channel.CreateBounded<ModbusPacket>(new BoundedChannelOptions(8192)
-{
-    FullMode = BoundedChannelFullMode.Wait,
-    SingleWriter = true,
-    SingleReader = false
-});
+var registrationResult = serial.RegisterContextRegistration(
+    "040_my_device",
+    new MyDeviceRegistration());
+```
 
-var workers = Enumerable.Range(0, 4)
-    .Select(_ => Task.Run(async () =>
-    {
-        await foreach (var pkt in persistQueue.Reader.ReadAllAsync(cts.Token))
-        {
-            await PersistPacketAsync(pkt);
-        }
-    }, cts.Token))
-    .ToArray();
+规则：
 
-try
+- key 建议使用数字前缀控制优先级
+- 数字越小优先级越高
+- 重复 key 会返回失败结果，不会覆盖已有注册
+
+### 2. 扩展协议解析器
+
+```csharp
+var parserResult = serial.RegisterParser(
+    ProtocolEnum.ModbusASCII,
+    "050_ascii_parser",
+    static () => new MyAsciiParser());
+```
+
+规则：
+
+- 注册维度是 `ProtocolEnum + TResult`
+- 同一维度重复注册会返回失败结果
+- 创建解析器时按实例级注册表解析，不依赖全局静态工厂
+
+### 3. 使用自定义解析器直接开口
+
+```csharp
+var open = await serial.OpenPortAsync(
+    "COM5",
+    115200,
+    Parity.None,
+    8,
+    StopBits.One,
+    new MyFrameParser());
+```
+
+如果希望 `RestartPortAsync(...)` 后仍能完整重建，优先使用 parser factory：
+```csharp
+var open = await serial.OpenPortAsync(
+    "COM5",
+    115200,
+    Parity.None,
+    8,
+    StopBits.One,
+    static () => new MyFrameParser());
+```
+
+## 运维与诊断
+
+### 服务级健康快照
+
+```csharp
+var health = serial.GetHealthSnapshot();
+Console.WriteLine($"open={health.OpenPortCount}, running={health.RunningPortCount}, faulted={health.FaultedPortCount}");
+```
+
+### 服务级诊断报告
+
+```csharp
+var report = serial.GetDiagnosticReport();
+Console.WriteLine(report.HealthStatus);
+Console.WriteLine(report.RecentErrors.Count);
+```
+
+### 单口运行时快照
+
+```csharp
+var runtime = serial.GetPortRuntimeSnapshot("COM9");
+if (runtime.IsSuccess && runtime.Snapshot is { } snapshot)
 {
-    await foreach (var pkt in modbusHandler.ReadParsedPacketsAsync(cts.Token))
+    Console.WriteLine(snapshot.CloseState);
+    Console.WriteLine(snapshot.LastReconnectReason);
+    Console.WriteLine(snapshot.RecentErrors.Count);
+}
+```
+
+### 端口重启
+
+```csharp
+var restart = await serial.RestartPortAsync("COM9");
+Console.WriteLine(restart.Message);
+```
+
+### 批量端口重启
+
+```csharp
+var batch = await serial.RestartPortsAsync(new[] { "COM9", "COM10" });
+Console.WriteLine($"success={batch.SuccessCount}, failure={batch.FailureCount}");
+```
+
+## 被动持续采集示例
+
+```csharp
+if (serial.TryGetContext("COM9", out var ctx) && ctx is BarcodeScannerHandler barcode)
+{
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+    await foreach (var text in barcode.ReadParsedPacketsAsync(cts.Token))
     {
-        await persistQueue.Writer.WriteAsync(pkt, cts.Token);
+        Console.WriteLine(text);
     }
 }
-catch (OperationCanceledException) { }
-finally
-{
-    persistQueue.Writer.TryComplete();
-    await Task.WhenAll(workers);
-}
 ```
 
-2) 事件订阅（轻量，同步通知）
+## 高速采集建议
 
-```csharp
-modbusContext.OnHandleChanged += (sender, e) =>
-{
-    var result = (OperateResult<ModbusPacket>)e;
-    // UI 线程需调度
-    Application.Current.Dispatcher.Invoke(() => ShowOnUi(result.Content));
-};
-```
+- 用 `ReadParsedPacketsAsync(...)` 消费持续数据，不要每条报文都 `Task.Run`
+- 持久化侧使用有界队列 + 固定 worker
+- 打开 `WaitBacklogAlertThreshold`，不要让积压静默增长
+- 长跑时关注运行快照、超时率、重连失败率、事件丢弃数
 
-3) 在 Handler 内部高性能处理（覆写 Hook）
+## 配置
 
-```csharp
-// 在自定义 Handler 中覆写
-protected override void OnParsed(ModbusPacket pkt)
-{
-    base.OnParsed(pkt); // 保留基类分发与统计
-    // 直接内存写入或聚合（注意不要阻塞）
-    _localAggregator.Add(pkt);
-}
-```
+只使用：
 
-要点：
-- 若使用 `ReadParsedPacketsAsync`，请传入 `CancellationToken` 并确保消费者能跟上生产速率；否则可能触发通道积压或丢包，具体行为取决于 `ResponseChannelFullMode` 配置。
-- `OnHandleChanged` 回调可能在解析线程触发；若在 UI 使用需切换线程上下文。
-- 不建议对每条报文执行 `_ = Task.Run(...)`；高吞吐长跑下容易造成任务堆积、线程池抖动和后续超时。
-
-### 适用场景与接口选择指南
-
-针对不同类型的硬件设备与业务需求，推荐遵循以下原则选择正确的收发接口：
-
-#### 1. 持续被动采集（未经请求数据主动上报）
-* **代表设备**：扫码枪、连续称重电子秤、心跳业务、定频RFID扫描器。
-* **适用接口**：**强烈推荐**使用异步流 `ReadParsedPacketsAsync`。
-* **原因**：设备随时产生无法预测体量的突发数据。使用 `await foreach` 配合后台长任务，通过底层 Channel 缓冲区平滑削峰，完美应对流量突变且无需手动调度线程。
-
-#### 2. 半主动/订阅型连续采集（一次指令，连绵不断）
-* **代表设备**：需要上位机发送“开始测试”指令后，才以较高频率持续爆传数据的仪器。
-* **适用接口**：**非常适用**异步流 `ReadParsedPacketsAsync`。
-* **原因**：通过 `TryWrite` 发送单条指令后，下机挂起一个 `await foreach` 的长期消费工作流接收连续测试结果，直到下发或者接收到“停止测试”信号（借由 `CancellationToken` 取消消费）。
-
-#### 3. 传统主从“一问一答”（被动从站式主动轮询）
-* **代表设备**：标准 Modbus 从站（如各类温湿度计、常规PLC寄存器读写），完全遵守“不问不说”的应答纪律。
-* **适用接口**：**坚决推荐**使用带匹配语义的 `SendRequestAsync`（如 `IModbusContext.SendRequestAsync`）。**不推荐**用流式接收。
-* **原因**：`SendRequestAsync` 内部天然集成了发送、挂起等待、特征字匹配与超时重试。如果在此场景强行用 `ReadParsedPacketsAsync` 等待数据，需要在业务层重新开发异常脆弱的请求序号映射（Request-Id mapping），违背了组件的设计初衷。
-
-## 配置片段（appsettings.json 示例）
-
-```json
-{
-  "SerialPortService": {
-    "GenericHandlerOptions": {
-      "ResponseChannelCapacity": 4096,
-      "ResponseChannelFullMode": "Wait",
-      "WaitModeQueueCapacity": 8192,
-      "DropWhenNoActiveRequest": false,
-      "SampleLogInterval": 200,
-      "ReconnectIntervalMs": 1000,
-      "MaxReconnectAttempts": 5,
-      "WaitBacklogAlertThreshold": 2048
-    }
-  }
-}
-```
-
-示例：在 .NET 启动代码中绑定配置并注入：
-
-```csharp
-var options = configuration.GetSection("SerialPortService:GenericHandlerOptions").Get<GenericHandlerOptions>();
-var handler = new ModbusHandler("COM3", 9600, Parity.None, 8, StopBits.One, logger, options);
-```
-
-使用 DI 方式异步打开端口：
-
-```csharp
-// 推荐：异步打开
-var result = await serialPortService.OpenPortAsync("COM3", 9600, Parity.None, 8, StopBits.One, HandleEnum.Default, ProtocolEnum.ModbusRTU);
-
-// 关闭时推荐：
-var closeResult = await serialPortService.CloseAllAsync();
-```
-
-如果是**主动请求 / 一问一答**场景，优先使用 `SendRequestAsync(...)`；
-如果是**被动持续采集 / 高频上报**场景，优先使用 `ReadParsedPacketsAsync(...)`；
-如果只是**发送命令且不希望抛异常**，优先使用 `TryWrite(...)`。
+- `SerialPortService:GenericHandlerOptions`
+- `SerialPortService:RequestDefaults`

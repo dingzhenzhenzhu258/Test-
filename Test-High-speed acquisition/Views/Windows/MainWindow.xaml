@@ -6,7 +6,7 @@
         xmlns:local="clr-namespace:Test_High_speed_acquisition.Views.Windows"
         xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
         mc:Ignorable="d"
-        Title="高速采集串口工具" Height="560" Width="920" WindowStartupLocation="CenterScreen"
+        Title="高速采集串口工具" Height="620" Width="980" WindowStartupLocation="CenterScreen"
         Background="#1E1E1E">
     <Grid Margin="16" Background="#1E1E1E">
         <Grid.RowDefinitions>
@@ -149,6 +149,42 @@
                             <TextBlock Text="停止发送" />
                         </StackPanel>
                     </Button>
+
+                    <Button Grid.Row="2"
+                            Grid.Column="0"
+                            MinWidth="110"
+                            Margin="674,12,8,0"
+                            HorizontalAlignment="Left"
+                            Command="{Binding RestartPortCommand}">
+                        <StackPanel Orientation="Horizontal">
+                            <ui:SymbolIcon Symbol="ArrowSync24" Margin="0,0,6,0" />
+                            <TextBlock Text="重启串口" />
+                        </StackPanel>
+                    </Button>
+
+                    <Button Grid.Row="2"
+                            Grid.Column="0"
+                            MinWidth="110"
+                            Margin="792,12,0,0"
+                            HorizontalAlignment="Left"
+                            Command="{Binding RefreshHealthCommand}">
+                        <StackPanel Orientation="Horizontal">
+                            <ui:SymbolIcon Symbol="Pulse24" Margin="0,0,6,0" />
+                            <TextBlock Text="刷新诊断" />
+                        </StackPanel>
+                    </Button>
+
+                    <Button Grid.Row="2"
+                            Grid.Column="0"
+                            MinWidth="110"
+                            Margin="910,12,0,0"
+                            HorizontalAlignment="Left"
+                            Command="{Binding ExportDiagnosticsCommand}">
+                        <StackPanel Orientation="Horizontal">
+                            <ui:SymbolIcon Symbol="ArrowDownload24" Margin="0,0,6,0" />
+                            <TextBlock Text="导出诊断" />
+                        </StackPanel>
+                    </Button>
                 </Grid>
 
                 <Expander Grid.Row="1"
@@ -196,6 +232,7 @@
         <Grid Grid.Row="2">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
@@ -209,7 +246,21 @@
                 <TextBlock Text="{Binding StatusMessage}" Foreground="#F3F3F3" />
             </Border>
 
-            <TextBox Grid.Row="1"
+            <Border Grid.Row="1"
+                    Margin="0,0,0,8"
+                    Padding="10,8"
+                    CornerRadius="8"
+                    BorderBrush="#3A3A3A"
+                    BorderThickness="1"
+                    Background="#20262B">
+                <StackPanel>
+                    <TextBlock Text="{Binding HealthSummary}" Foreground="#D6F5FF" />
+                    <TextBlock Text="{Binding RecentDiagnostics}" Foreground="#FFCCAA" FontSize="11" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding LastDiagnosticExportPath}" Foreground="#8FB6C3" FontSize="11" />
+                </StackPanel>
+            </Border>
+
+            <TextBox Grid.Row="2"
                      x:Name="ReceivedDataTextBox"
                      Padding="10"
                      VerticalScrollBarVisibility="Auto"

@@ -18,8 +18,8 @@ namespace SerialPortService.Services.Handler
         /// <summary>
         /// 创建控制器处理器。
         /// </summary>
-        public ControllerHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger)
-            : base(portName, baudRate, parity, dataBits, stopBits, new ControllerParser(), logger)
+        public ControllerHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, ILogger logger, GenericHandlerOptions? options = null)
+            : base(portName, baudRate, parity, dataBits, stopBits, new ControllerParser(), logger, options)
         {
             // 步骤1：沿用基类初始化串口上下文。
             // 为什么：控制器处理器不需要额外构造参数。

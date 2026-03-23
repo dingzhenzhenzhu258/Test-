@@ -67,7 +67,7 @@ namespace SerialPortService.Services.Handler
         /// <param name="options">通用处理参数</param>
         /// <param name="matcher">响应匹配策略（可空）</param>
         public GenericHandler(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits, IStreamParser<T> parser, ILogger logger, GenericHandlerOptions? options = null, IResponseMatcher<T>? matcher = null)
-            : base(portName, baudRate, parity, dataBits, stopBits, logger)
+            : base(portName, baudRate, parity, dataBits, stopBits, logger, options)
         {
             _parser = parser ?? throw new ArgumentNullException(nameof(parser));
             _options = options ?? new GenericHandlerOptions();
@@ -80,6 +80,16 @@ namespace SerialPortService.Services.Handler
                 throw new ArgumentOutOfRangeException(nameof(options), "SampleLogInterval must be >= 0");
             if (_options.WaitModeQueueCapacity <= 0)
                 throw new ArgumentOutOfRangeException(nameof(options), "WaitModeQueueCapacity must be > 0");
+            if (_options.SendChannelCapacity <= 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "SendChannelCapacity must be > 0");
+            if (_options.RawInputChannelCapacity <= 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "RawInputChannelCapacity must be > 0");
+            if (_options.RawReadBufferSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "RawReadBufferSize must be > 0");
+            if (_options.SerialPortReadBufferSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "SerialPortReadBufferSize must be > 0");
+            if (_options.ParsedEventChannelCapacity <= 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "ParsedEventChannelCapacity must be > 0");
 
             _responseChannel = Channel.CreateBounded<T>(new BoundedChannelOptions(_options.ResponseChannelCapacity)
             {
@@ -247,7 +257,8 @@ namespace SerialPortService.Services.Handler
                 Interlocked.Read(ref _totalLatencyMs),
                 Volatile.Read(ref _activeRequests),
                 Interlocked.Read(ref _waitModeQueueLength),
-                Interlocked.Read(ref _waitModeQueueHighWatermark));
+                Interlocked.Read(ref _waitModeQueueHighWatermark),
+                GetRuntimeSnapshot().ParsedEventDropCount);
 
         public long GetParsedPacketDropCount()
             => Interlocked.Read(ref _parsedPacketDropCount);

@@ -25,8 +25,9 @@ namespace SerialPortService.Services.Handler
             Parity parity,
             int dataBits,
             StopBits stopBits,
-            ILogger logger)
-            : base(portName, baudRate, parity, dataBits, stopBits, logger)
+            ILogger logger,
+            GenericHandlerOptions? options = null)
+            : base(portName, baudRate, parity, dataBits, stopBits, logger, options)
         {
         }
 
@@ -40,8 +41,9 @@ namespace SerialPortService.Services.Handler
             int dataBits,
             StopBits stopBits,
             IStreamParser<T> parser,
-            ILogger logger)
-            : this(portName, baudRate, parity, dataBits, stopBits, logger)
+            ILogger logger,
+            GenericHandlerOptions? options = null)
+            : this(portName, baudRate, parity, dataBits, stopBits, logger, options)
         {
             SetParser(parser);
         }
