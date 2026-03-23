@@ -1,160 +1,141 @@
-# Logger 库完整说明
+# Logger
 
-`Logger` 是解决方案内统一日志基础设施，负责：
+`Logger` 是这个项目里的统一日志基础库，负责：
 
-- 统一日志输出（`Serilog`）
-- 统一追踪/指标采集（`OpenTelemetry`）
-- 统一故障降级与恢复（OTLP 不可达时自动回退）
-- 统一上下文增强（方法名、文件、行号、设备信息）
+- 本地业务日志落盘
+- OpenTelemetry / OpenObserve 日志上报
+- OTLP 断线时自动切到离线补传队列
+- 服务器恢复后自动补传，并保留原始日志时间
+- 为日志补充调用位置、事件标识、重放标记等诊断信息
 
-支持场景：`WebAPI`、`WPF/桌面`、后台服务。
+## 主要入口
 
----
+- `Logger/Extensions/LoggerExtensions.cs`
+  - `AddSerilogLogging(...)`
+  - `StartTrace(...)`
+  - `GetReplayQueueMetrics()`
+  - `GetReplayQueueDiagnostics()`
+- `Logger/Internals/OtlpReplayQueueManager.cs`
+  - 离线队列写入、重放、清理、容量控制、`.tmp` 恢复
 
-## 1. 项目结构
+## 当前行为
 
-- `Extensions/LoggerExtensions.cs`
-  - 日志主入口：`AddSerilogLogging(...)`
-  - OTLP 可达性探测、降级、恢复探测、热恢复
-  - 自定义追踪入口：`StartTrace(...)`
-- `Helpers/LoggerHelper.cs`
-  - 统一扩展方法：`ILogger.AddLog(...)`
-  - UI 联动事件：`OnUILog`
-- `Extensions/LoggerLevelManager.cs`
-  - 运行时动态日志级别控制
-- `Extensions/GlobalDeviceInfo.cs`
-  - 机器名、版本、IP、MAC 采集
-- `Extensions/WebAPI/*`
-  - `GlobalExceptionMiddleware`：全局异常兜底
-  - `RequestResponseLoggingMiddleware`：请求响应审计日志
-- `Logger.wpf/Extensions/WpfExceptionExtensions.cs`
-  - WPF 全局异常订阅（UI 线程/后台线程/Task）
+### 1. 启动时日志服务器不可用
 
----
+- 业务日志仍然写入 `logs/app.log`
+- Logger 会记录 OTLP 不可用的生命周期日志
+- 离线期间的待补传日志进入 `logs/otlp-replay`
+- 服务器恢复后自动探测并自动补传
+- 补传时使用原始 `TimestampUtc`，不是补传发生时刻
 
-## 2. 快速接入
+### 2. 启动时日志服务器可用，运行中断开
 
-### 2.1 通用注册（DI）
+- 正常日志先走 OTLP
+- 一旦 OTLP sink 失败，SelfLog 会触发降级
+- 最近一小段时间内的日志会回补进离线队列，减少断点丢失
+- 后续新日志继续写本地，并进入补传队列
+- 服务器恢复后自动重建 OTLP 转发 sink 并补传
+
+### 3. 多次断开 / 恢复
+
+- 恢复监测器会在每次再次断线后重新启动
+- 队列支持多次累积、多次补传
+- 已确认上传的事件会通过 `EventId` / `ReplayId` 去重校验，避免整批重复确认
+
+## 本地文件说明
+
+- `logs/app.log`
+  - 常规业务日志
+- `logs/replay.log`
+  - 补传到远端成功后，在本地额外留痕的补传日志
+- `logs/fallback.log`
+  - Logger 自身的降级、恢复、补传、清理异常提示
+  - 不再承载常规业务日志
+- `logs/otlp-replay/*.jsonl`
+  - 离线补传队列
+  - 每行一条待补传日志
+
+## 队列诊断指标
+
+保留旧接口：
 
 ```csharp
-services.AddSerilogLogging(configuration, projectName: "YourServiceName", isWebApi: false);
+var metrics = LoggerExtensions.GetReplayQueueMetrics();
 ```
 
-> `projectName` 必须唯一，且不能使用默认值 `xxxapi`。
-
-### 2.2 WebAPI 推荐顺序
+新增完整诊断接口：
 
 ```csharp
-app.UseGlobalExceptionHandler();
-app.UseRequestResponseLogging();
+var diagnostics = LoggerExtensions.GetReplayQueueDiagnostics();
 ```
 
-### 2.3 WPF 推荐接入
+字段说明：
 
-```csharp
-app.SubscribeGlobalExceptions(logger);
+- `FileCount`
+  - 当前补传队列文件数
+- `TempFileCount`
+  - 尚未恢复完成的临时队列文件数
+- `TotalBytes`
+  - 队列总大小
+- `TotalEntries`
+  - 队列中仍待处理的总条数
+- `PendingConfirmationEntries`
+  - 已经发送过但尚未确认成功，仍留在队列中的条数
+- `ReplayFailureCount`
+  - 累计失败重放次数
+- `SuccessfulReplayCount`
+  - 当前进程内累计成功确认的补传条数
+- `LastSuccessfulReplayUtc`
+  - 最近一次成功补传确认时间
+- `LastReplayAttemptUtc`
+  - 最近一次失败后进入待确认状态的时间
+
+## OpenObserve 配置
+
+当前库支持两种方式设置认证：
+
+### 方式 1. 直接写 Header
+
+```json
+"Logger": {
+  "Otlp": {
+    "Headers": "Authorization=Basic xxxxx"
+  }
+}
 ```
 
----
+### 方式 2. 写用户名密码
 
-## 3. OTLP 智能降级与自动恢复
+```json
+"Logger": {
+  "Otlp": {
+    "Username": "admin@example.com",
+    "Password": "Kb123456@"
+  }
+}
+```
 
-### 3.1 启动阶段
+如果同时配置了 `Headers` 和 `Username` / `Password`，优先使用 `Headers`。
 
-- 若 `OTLP` 可达：正常启用日志/追踪/指标导出。
-- 若 `OTLP` 不可达：
-  - 常规业务日志继续写入本地 `logs/app.log`；
-  - `logs/fallback.log` 仅记录 `OTLP` 失败/恢复提示与补传异常；
-  - 记录明确告警；
-  - 启动后台恢复探测。
+## 已验证场景
 
-### 3.2 运行阶段
+下面这些场景已经实际跑通过：
 
-- `Logs`：可在端点恢复后自动热恢复（无需重启，受配置控制）。
-- `Tracing/Metrics`：可保持导出器启用，端点恢复后自动继续上报（受配置控制）。
-- `Tracing/Metrics`：也可启用“运行时热重建模式”，在启动时未挂载导出器的情况下，端点恢复后动态重建并恢复上报（受配置控制）。
-- `Logs`：支持本地落盘补传队列（JSONL），离线期间写入 `logs/otlp-replay.queue.jsonl`，恢复后按批重放。
+- 启动时服务离线，稍后恢复，日志自动补传
+- 启动时服务在线，运行中断开，再恢复，日志自动补传
+- 多次断开 / 多次恢复
+- 离线退出后，下次启动触发补传
+- 接近进程退出时恢复
+- 快速抖动断线
+- `.tmp` 队列文件恢复
 
-### 3.3 关键保障
+## 排查建议
 
-- SelfLog 一次性异常告警抑制，避免日志风暴。
-- 本地兜底日志持续可用。
-- 恢复后有明确提示，便于运维确认状态。
-
----
-
-## 4. 配置项（`Logger/appsettings.json`）
-
-`Logger:Otlp`：
-
-- `Enabled`：总开关（是否启用 OTLP 能力）
-- `ProbeOnStartup`：是否启动时探测端点可达性
-- `ProbeTimeoutMs`：探测超时（毫秒）
-- `AutoRecoverProbe`：是否启用后台恢复探测
-- `AutoRecoverProbeIntervalMs`：恢复探测周期（毫秒）
-- `AutoRecoverApplyForLogs`：端点恢复后是否自动热恢复日志导出
-- `AutoRecoverApplyForTelemetry`：是否让追踪/指标保持自动恢复策略
-- `AutoRecoverApplyForTelemetryRuntimeSwitch`：是否启用 Tracing/Metrics 运行时热重建（默认 `false`）
-- `ReplayQueueEnabled`：是否启用离线日志补传队列
-- `ReplayBatchSize`：每次恢复时最大重放条数
-- `ReplayQueueMaxFileSizeMb`：单个补传分段文件上限（MB）
-- `ReplayQueueMaxTotalSizeMb`：补传目录总大小上限（MB）
-- `ReplayQueueMaxAgeHours`：补传文件最大保留时长（小时）
-- `ReplayQueueOverflowStrategy`：容量超限策略（`DropOldest` / `RejectNew` / `WarnOnly`）
-- `LogsEndpoint` / `TracesEndpoint` / `MetricsEndpoint`：三类导出端点
-
-`Serilog`：
-
-- `MinimumLevel`：默认及覆盖级别
-- `WriteTo`：控制台/常规文件输出模板（默认业务日志写入 `logs/app.log`）
-- `Enrich`：附加上下文（线程、LogContext 等）
-
----
-
-## 5. 公开能力清单
-
-### 5.1 `LoggerExtensions`
-
-- `EnsureConfigInitialized(...)`：自动释放默认配置文件
-- `AddSerilogLogging(...)`：注册日志/追踪/指标全链路
-- `StartTrace(...)`：创建自定义耗时追踪片段
-
-### 5.2 `LoggerHelper`
-
-- `AddLog(...)`：统一日志扩展（支持异常、UI、调用位置信息）
-- `OnUILog`：可供 UI 层订阅实时日志输出
-
-### 5.3 `LoggerLevelManager`
-
-- `LogSwitch`：全局动态日志级别开关
-- `SetLevel(...)`：运行时动态调节级别
-
-### 5.4 WebAPI 扩展
-
-- `UseGlobalExceptionHandler()`
-- `UseRequestResponseLogging()`
-
-### 5.5 WPF 扩展
-
-- `SubscribeGlobalExceptions(...)`
-
----
-
-## 6. 运维排障建议
-
-- 看板无日志：先核对 `projectName == service.name`。
-- 仅本地有日志：检查 `logs/fallback.log` 中 OTLP 回退告警。
-- 端点恢复后仍无远端日志：
-  - 检查 `AutoRecoverApplyForLogs`；
-  - 检查认证头与端点地址；
-  - 检查网络与端口连通性。
-- 补传日志时间戳：补传事件使用**原始产生时间**（`entry.TimestampUtc`），而非补传执行时间。在 OpenObserve 中搜索 `ReplayQueue=true` 可定位所有补传日志。
-
----
-
-## 7. 约束与建议
-
-- 生产环境必须使用唯一 `projectName`。
-- 推荐保留本地文件 sink 作为最终兜底。
-- WebAPI 中间件顺序建议：全局异常在外层，请求响应日志紧随其后。
-- 高并发场景建议配合动态级别控制，避免过量日志影响吞吐。
+- 看不到远端日志时，先检查 `projectName`
+- 再检查 `fallback.log` 是否有 OTLP 断开或认证失败提示
+- 再确认 `LogsEndpoint`、账号密码、OpenObserve 流和查询时间范围
+- 如果本地队列不为空，优先看 `GetReplayQueueDiagnostics()` 里的：
+  - `TotalEntries`
+  - `PendingConfirmationEntries`
+  - `LastSuccessfulReplayUtc`
+  - `LastReplayAttemptUtc`

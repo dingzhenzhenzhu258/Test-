@@ -514,52 +514,96 @@ namespace Test_High_speed_acquisition.ViewModels.Windows
         /// </summary>
         private async Task SendLoopAsync(IModbusContext modbus, CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            //while (!cancellationToken.IsCancellationRequested)
+            //{
+            //    // 步骤1：记录本轮开始时间。
+            //    // 为什么：用于实现“任意 ms 配置”的精确轮询节奏。
+            //    // 风险点：仅使用固定 Delay 会叠加处理时间，实际周期会漂移。
+            //    var cycleWatch = Stopwatch.StartNew();
+
+            //    // 步骤2：构建并发送读取命令。
+            //    // 为什么：统一走 Modbus 请求-响应闭环，避免高频盲发。
+            //    // 风险点：若并行发送或不等响应，易出现回包串台与丢包。
+            //    var command = BuildReadCommand();
+            //    var txHex = BitConverter.ToString(command);
+            //    Interlocked.Increment(ref _totalSendCount);
+            //    Interlocked.Increment(ref _segmentSendCount);
+            //    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX: {txHex}");
+            //    _logger.AddLog(LogLevel.Information, "发送命令: {Command}", args: new object[] { txHex });
+            //    try
+            //    {
+            //        // 步骤3：等待匹配响应（同步轮询核心）。
+            //        // 为什么：确保一问一答，杜绝 20ms 高频下的“只发不收”。
+            //        // 风险点：超时参数过小会频繁超时，过大则降低吞吐。
+            //        var packet = await modbus.SendRequestAsync(command, timeout: 3000, retryCount: 1, cancellationToken).ConfigureAwait(false);
+            //        var index = Interlocked.Increment(ref _totalReceiveCount);
+            //        Interlocked.Increment(ref _segmentReceiveCount);
+            //        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] #{index} RX: {BitConverter.ToString(packet.RawFrame)}");
+            //        _logger.AddLog(LogLevel.Information, "接收响应: {Response}", args: new object[] { BitConverter.ToString(packet.RawFrame) });
+            //    }
+            //    catch (OperationCanceledException)
+            //    {
+            //        break;
+            //    }
+            //    catch (Exception ex)
+            //    {
+            //        _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
+            //        _logger.AddLog(LogLevel.Error, "发送循环接收响应失败，Command={Command}", exception: ex, args: txHex);
+            //    }
+
+            //    // 步骤4：按配置补齐剩余周期，支持任意 ms（含 0ms）。
+            //    // 为什么：当响应快于周期时保持固定节奏；响应慢于周期时立即下一轮。
+            //    // 风险点：不扣除处理耗时会导致实际周期 > 配置值。
+            //    cycleWatch.Stop();
+            //    var remainingMs = PollIntervalMs - (int)cycleWatch.ElapsedMilliseconds;
+            //    if (remainingMs > 0)
+            //    {
+            //        await Task.Delay(remainingMs, cancellationToken).ConfigureAwait(false);
+            //    }
+            //}
+
+            // 步骤1：记录本轮开始时间。
+            // 为什么：用于实现“任意 ms 配置”的精确轮询节奏。
+            // 风险点：仅使用固定 Delay 会叠加处理时间，实际周期会漂移。
+            var cycleWatch = Stopwatch.StartNew();
+
+            // 步骤2：构建并发送读取命令。
+            // 为什么：统一走 Modbus 请求-响应闭环，避免高频盲发。
+            // 风险点：若并行发送或不等响应，易出现回包串台与丢包。
+            var command = BuildReadCommand();
+            var txHex = BitConverter.ToString(command);
+            Interlocked.Increment(ref _totalSendCount);
+            Interlocked.Increment(ref _segmentSendCount);
+            _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX: {txHex}");
+            _logger.AddLog(LogLevel.Information, "发送命令: {Command}", args: new object[] { txHex });
+            try
             {
-                // 步骤1：记录本轮开始时间。
-                // 为什么：用于实现“任意 ms 配置”的精确轮询节奏。
-                // 风险点：仅使用固定 Delay 会叠加处理时间，实际周期会漂移。
-                var cycleWatch = Stopwatch.StartNew();
+                // 步骤3：等待匹配响应（同步轮询核心）。
+                // 为什么：确保一问一答，杜绝 20ms 高频下的“只发不收”。
+                // 风险点：超时参数过小会频繁超时，过大则降低吞吐。
+                var packet = await modbus.SendRequestAsync(command, timeout: 3000, retryCount: 1, cancellationToken).ConfigureAwait(false);
+                var index = Interlocked.Increment(ref _totalReceiveCount);
+                Interlocked.Increment(ref _segmentReceiveCount);
+                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] #{index} RX: {BitConverter.ToString(packet.RawFrame)}");
+                _logger.AddLog(LogLevel.Information, "接收响应: {Response}", args: new object[] { BitConverter.ToString(packet.RawFrame) });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
+                _logger.AddLog(LogLevel.Error, "发送循环接收响应失败，Command={Command}", exception: ex, args: txHex);
+            }
 
-                // 步骤2：构建并发送读取命令。
-                // 为什么：统一走 Modbus 请求-响应闭环，避免高频盲发。
-                // 风险点：若并行发送或不等响应，易出现回包串台与丢包。
-                var command = BuildReadCommand();
-                var txHex = BitConverter.ToString(command);
-                Interlocked.Increment(ref _totalSendCount);
-                Interlocked.Increment(ref _segmentSendCount);
-                _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] TX: {txHex}");
-                _logger.AddLog(LogLevel.Information, "发送命令: {Command}", args: new object[] { txHex });
-                try
-                {
-                    // 步骤3：等待匹配响应（同步轮询核心）。
-                    // 为什么：确保一问一答，杜绝 20ms 高频下的“只发不收”。
-                    // 风险点：超时参数过小会频繁超时，过大则降低吞吐。
-                    var packet = await modbus.SendRequestAsync(command, timeout: 3000, retryCount: 1, cancellationToken).ConfigureAwait(false);
-                    var index = Interlocked.Increment(ref _totalReceiveCount);
-                    Interlocked.Increment(ref _segmentReceiveCount);
-                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] #{index} RX: {BitConverter.ToString(packet.RawFrame)}");
-                    _logger.AddLog(LogLevel.Information, "接收响应: {Response}", args: new object[] { BitConverter.ToString(packet.RawFrame) });
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    _uiLines.Writer.TryWrite($"[{DateTime.Now:HH:mm:ss.fff}] RX-ERR: {ex.Message}");
-                    _logger.AddLog(LogLevel.Error, "发送循环接收响应失败，Command={Command}", exception: ex, args: txHex);
-                }
-
-                // 步骤4：按配置补齐剩余周期，支持任意 ms（含 0ms）。
-                // 为什么：当响应快于周期时保持固定节奏；响应慢于周期时立即下一轮。
-                // 风险点：不扣除处理耗时会导致实际周期 > 配置值。
-                cycleWatch.Stop();
-                var remainingMs = PollIntervalMs - (int)cycleWatch.ElapsedMilliseconds;
-                if (remainingMs > 0)
-                {
-                    await Task.Delay(remainingMs, cancellationToken).ConfigureAwait(false);
-                }
+            // 步骤4：按配置补齐剩余周期，支持任意 ms（含 0ms）。
+            // 为什么：当响应快于周期时保持固定节奏；响应慢于周期时立即下一轮。
+            // 风险点：不扣除处理耗时会导致实际周期 > 配置值。
+            cycleWatch.Stop();
+            var remainingMs = PollIntervalMs - (int)cycleWatch.ElapsedMilliseconds;
+            if (remainingMs > 0)
+            {
+                await Task.Delay(remainingMs, cancellationToken).ConfigureAwait(false);
             }
         }
 

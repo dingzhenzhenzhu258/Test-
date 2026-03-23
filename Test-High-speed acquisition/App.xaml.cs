@@ -1,11 +1,13 @@
 ﻿using CommunityToolkit.Mvvm.Messaging;
 using Logger.Extensions;
+using Logger.Helpers;
 using Logger.wpf.Extensions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SerialPortService.Extensions;
+using System;
 using System.IO;
 using System.Windows;
 using Test_High_speed_acquisition.Services;
@@ -32,11 +34,7 @@ namespace Test_High_speed_acquisition
         private static readonly IHost _host = Host.CreateDefaultBuilder()
         .ConfigureAppConfiguration(c =>
         {
-            var basePath =
-                Path.GetDirectoryName(AppContext.BaseDirectory)
-                ?? throw new DirectoryNotFoundException(
-                    "Unable to find the base directory of the application."
-                );
+            var basePath = ResolveConfigurationBasePath();
 
             LoggerExtensions.EnsureConfigInitialized(basePath, "appsettings.json");
             _ = c.SetBasePath(basePath).AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
@@ -97,6 +95,30 @@ namespace Test_High_speed_acquisition
             await _host.StartAsync();
 
             var logger = Services.GetRequiredService<ILogger<App>>();
+            var configuration = Services.GetRequiredService<IConfiguration>();
+            var configBasePath = ResolveConfigurationBasePath();
+            var configPath = Path.Combine(configBasePath, "appsettings.json");
+            var username = configuration["Logger:Otlp:Username"];
+            var rawHeaders = configuration["Logger:Otlp:Headers"];
+            var hasGeneratedBasicAuth = !string.IsNullOrWhiteSpace(username)
+                && configuration["Logger:Otlp:Password"] != null;
+            var hasAuthHeaders = !string.IsNullOrWhiteSpace(rawHeaders) || hasGeneratedBasicAuth;
+
+            logger.AddLog(
+                LogLevel.Information,
+                "Logger startup diagnostics: ConfigPath={ConfigPath}, LogsEndpoint={LogsEndpoint}, TracesEndpoint={TracesEndpoint}, MetricsEndpoint={MetricsEndpoint}, HasAuthHeaders={HasAuthHeaders}, HasExplicitHeaders={HasExplicitHeaders}, HasUsername={HasUsername}, ReplayQueueEnabled={ReplayQueueEnabled}",
+                args:
+                [
+                    configPath,
+                    configuration["Logger:Otlp:LogsEndpoint"] ?? "<null>",
+                    configuration["Logger:Otlp:TracesEndpoint"] ?? "<null>",
+                    configuration["Logger:Otlp:MetricsEndpoint"] ?? "<null>",
+                    hasAuthHeaders,
+                    !string.IsNullOrWhiteSpace(rawHeaders),
+                    !string.IsNullOrWhiteSpace(username),
+                    configuration.GetValue<bool?>("Logger:Otlp:ReplayQueueEnabled") ?? true
+                ]);
+
             Current.SubscribeGlobalExceptions(logger);
         }
 
@@ -107,6 +129,23 @@ namespace Test_High_speed_acquisition
         {
             await _host.StopAsync();
             _host.Dispose();
+        }
+
+        private static string ResolveConfigurationBasePath()
+        {
+            var current = new DirectoryInfo(AppContext.BaseDirectory);
+            while (current != null)
+            {
+                var projectFile = Path.Combine(current.FullName, "Test-High-speed acquisition.csproj");
+                if (File.Exists(projectFile))
+                {
+                    return current.FullName;
+                }
+
+                current = current.Parent;
+            }
+
+            return AppContext.BaseDirectory;
         }
     }
 }

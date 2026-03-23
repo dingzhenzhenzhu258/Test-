@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Logging;
-using LoggerExtensionsHost = Logger.Extensions.LoggerExtensions;
 using Serilog.Context;
 using System;
 using System.Collections.Generic;
@@ -108,8 +107,6 @@ namespace Logger.Helpers
                 // 步骤2：当 OTLP 不可用时将业务日志入本地补传队列。
                 // 为什么：保障离线窗口内日志不因远端不可达而永久丢失。
                 // 风险点：若消息格式化失败会影响补传可读性。
-                var replayMessage = BuildReplayMessage(messageTemplate, safeArgs);
-                LoggerExtensionsHost.EnqueueReplayLogIfNeeded(level, replayMessage, exception);
             }
         }
 

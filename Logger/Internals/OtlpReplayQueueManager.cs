@@ -1,132 +1,118 @@
 using Serilog;
 using Serilog.Events;
 using Serilog.Parsing;
+using Serilog.Sinks.OpenTelemetry;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 
 namespace Logger.Internals
 {
-    /// <summary>
-    /// OTLP 补传队列管理器。
-    /// 负责离线日志的分段存储、ACK 删除、大小上限控制与年龄清理。
-    /// </summary>
     internal static class OtlpReplayQueueManager
     {
         private static readonly string QueueDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs", "otlp-replay");
         private static readonly object QueueLock = new();
+        private static readonly Queue<string> RecentEnqueueIds = new();
+        private static readonly HashSet<string> RecentEnqueueIdSet = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly MessageTemplateParser TemplateParser = new();
+        private static readonly MessageTemplate ReplayTemplate = TemplateParser.Parse("[Replay] {Message}");
+        private static readonly MessageTemplate ReplayWithExTemplate = TemplateParser.Parse("[Replay] {Message} | Exception: {ReplayException}");
+
         private static string? _currentQueueFile;
         private static long _replayFailureCount;
+        private static long _successfulReplayCount;
+        private static long _lastSuccessfulReplayUtcTicks;
+        private static long _lastReplayAttemptUtcTicks;
+        private static long _maxFileSizeBytes = 50L * 1024 * 1024;
+        private static long _maxTotalSizeBytes = 500L * 1024 * 1024;
+        private static int _maxAgeHours = 72;
         private static OverflowStrategy _overflowStrategy = OverflowStrategy.DropOldest;
+        private const int RecentEnqueueIdLimit = 8192;
+        private static readonly TimeSpan ReplayRetryCooldown = TimeSpan.FromSeconds(15);
 
-        // 步骤0：预编译补传消息模板，避免每条日志重复解析。
-        // 为什么：MessageTemplateParser.Parse 有正则开销，缓存后复用可提升吞吐。
-        // 风险点：模板占位符名称必须与 LogEventProperty 名称严格一致。
-        private static readonly MessageTemplateParser _templateParser = new();
-        private static readonly MessageTemplate _replayTemplate =
-            _templateParser.Parse("[Replay] {Message}");
-        private static readonly MessageTemplate _replayWithExTemplate =
-            _templateParser.Parse("[Replay] {Message} | Exception: {ReplayException}");
+        private static string? _otlpLogsEndpoint;
+        private static string? _otlpHeaders;
+        private static Dictionary<string, object> _otlpResourceAttributes = new();
+        private static Func<int>? _getOtlpFailureVersion;
 
-        // 默认配置
-        private static long _maxFileSizeBytes = 50L * 1024 * 1024; // 50MB
-        private static long _maxTotalSizeBytes = 500L * 1024 * 1024; // 500MB
-        private static int _maxAgeHours = 72; // 3 天
-
-        /// <summary>
-        /// 配置补传队列容量与保留策略。
-        /// </summary>
         public static void Configure(long maxFileSizeBytes, long maxTotalSizeBytes, int maxAgeHours, string? overflowStrategy = null)
         {
             lock (QueueLock)
             {
-                // 步骤1：对输入配置做最小边界保护。
-                // 为什么：避免错误配置导致队列不可写或清理失效。
-                // 风险点：配置过小会导致频繁轮转与删除，影响补传完整性。
                 _maxFileSizeBytes = Math.Max(1L * 1024 * 1024, maxFileSizeBytes);
                 _maxTotalSizeBytes = Math.Max(_maxFileSizeBytes, maxTotalSizeBytes);
                 _maxAgeHours = Math.Max(1, maxAgeHours);
-
-                // 步骤2：解析溢出策略。
-                // 为什么：不同环境对“满队列时行为”诉求不同。
-                // 风险点：策略配置错误会回退默认 DropOldest。
-                _overflowStrategy = Enum.TryParse<OverflowStrategy>(overflowStrategy, true, out var parsed)
+                _overflowStrategy = Enum.TryParse(overflowStrategy, true, out OverflowStrategy parsed)
                     ? parsed
                     : OverflowStrategy.DropOldest;
             }
         }
 
-        /// <summary>
-        /// 入队一条日志到本地补传队列。
-        /// </summary>
+        public static void ConfigureOtlpReplay(
+            string otlpLogsEndpoint,
+            string? otlpHeaders,
+            IDictionary<string, object> resourceAttributes,
+            Func<int> getOtlpFailureVersion)
+        {
+            lock (QueueLock)
+            {
+                _otlpLogsEndpoint = otlpLogsEndpoint;
+                _otlpHeaders = otlpHeaders;
+                _otlpResourceAttributes = new Dictionary<string, object>(resourceAttributes);
+                _getOtlpFailureVersion = getOtlpFailureVersion;
+            }
+        }
+
         public static void Enqueue(string level, string message, string? exception)
+        {
+            Enqueue(DateTime.UtcNow, level, message, exception);
+        }
+
+        public static void Enqueue(DateTime timestampUtc, string level, string message, string? exception)
         {
             var entry = new ReplayLogEntry
             {
-                TimestampUtc = DateTime.UtcNow,
+                TimestampUtc = timestampUtc.Kind == DateTimeKind.Utc ? timestampUtc : timestampUtc.ToUniversalTime(),
                 Level = level,
                 Message = message,
-                Exception = exception
+                Exception = exception,
+                ReplayId = ComputeEventId(timestampUtc, level, message, exception)
             };
 
             try
             {
                 lock (QueueLock)
                 {
+                    if (!TryRememberRecentEnqueueId(entry.ReplayId!))
+                    {
+                        return;
+                    }
+
                     Directory.CreateDirectory(QueueDir);
-
-                    // 步骤1：清理超龄文件。
-                    // 为什么：防止过期日志无限堆积。
-                    // 风险点：不清理会导致磁盘空间被历史队列占满。
                     CleanupExpiredFiles();
-
-                    // 步骤2：执行总大小上限与溢出策略。
-                    // 为什么：确保补传队列不会耗尽磁盘空间。
-                    // 风险点：不限制会在长时间离线场景导致磁盘写满。
                     if (!EnforceSizeLimit())
                     {
                         return;
                     }
 
-                    // 步骤3：获取或创建当前活跃队列文件。
-                    // 为什么：单文件过大影响读写性能，分段提升效率。
-                    // 风险点：不分段会导致单文件数百 MB 难以管理。
                     var filePath = GetOrCreateCurrentFile();
-                    var line = JsonSerializer.Serialize(entry);
-                    File.AppendAllText(filePath, line + Environment.NewLine, Encoding.UTF8);
-
-                    // 步骤4：检查当前文件大小并按需轮换。
-                    // 为什么：控制单文件大小便于分批重放与删除。
-                    // 风险点：不轮换会导致单文件持续增长。
+                    File.AppendAllText(filePath, JsonSerializer.Serialize(entry) + Environment.NewLine, Encoding.UTF8);
                     RotateFileIfNeeded(filePath);
                 }
             }
             catch (Exception ex)
             {
-                // 补传队列写入失败不应影响主流程，静默记录。
-                try
-                {
-                    var fallbackPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs", "fallback.log");
-                    File.AppendAllText(fallbackPath,
-                        $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [Logger] 补传队列写入失败: {ex.Message}{Environment.NewLine}",
-                        Encoding.UTF8);
-                }
-                catch
-                {
-                }
+                LogFallbackNotice($"补传队列写入失败: {ex.Message}");
             }
         }
 
-        /// <summary>
-        /// 重放补传队列中的离线日志。
-        /// </summary>
-        /// <param name="maxBatchSize">最大重放条数</param>
-        /// <param name="onNotice">告警回调</param>
-        /// <returns>(replayed, failed)</returns>
         public static (int replayed, int failed) ReplayQueued(int maxBatchSize, Action<string> onNotice)
         {
             lock (QueueLock)
@@ -136,12 +122,10 @@ namespace Logger.Internals
                     return (0, 0);
                 }
 
-                // 步骤1：按时间顺序重放所有队列文件。
-                // 为什么：确保先入先出，保持日志时序。
-                // 风险点：不排序会导致新日志先重放，旧日志后重放。
+                RecoverTempQueueFiles();
                 var files = Directory.GetFiles(QueueDir, "otlp-replay.*.jsonl", SearchOption.TopDirectoryOnly)
-                    .Select(f => new FileInfo(f))
-                    .OrderBy(f => f.CreationTimeUtc)
+                    .Select(path => new FileInfo(path))
+                    .OrderBy(info => info.CreationTimeUtc)
                     .ToList();
 
                 if (files.Count == 0)
@@ -154,30 +138,19 @@ namespace Logger.Internals
 
                 foreach (var fileInfo in files)
                 {
-                    // 步骤2：分批重放单个文件。
-                    // 为什么：避免一次性加载超大文件到内存。
-                    // 风险点：全量加载会在百万日志场景触发 OOM。
-                    var (replayed, failed) = ReplaySingleFile(fileInfo.FullName, maxBatchSize - totalReplayed);
+                    var remainingBudget = maxBatchSize - totalReplayed;
+                    if (remainingBudget <= 0)
+                    {
+                        break;
+                    }
+
+                    var (replayed, failed, hasRemaining) = ReplaySingleFile(fileInfo.FullName, remainingBudget);
                     totalReplayed += replayed;
                     totalFailed += failed;
 
-                    // 步骤3：重放成功则 ACK 删除该文件。
-                    // 为什么：确保不丢失（先发送成功再删除）。
-                    // 风险点：若先删除后发送，发送失败会导致永久丢失。
-                    if (failed == 0)
+                    if (!hasRemaining)
                     {
-                        try
-                        {
-                            File.Delete(fileInfo.FullName);
-                        }
-                        catch
-                        {
-                        }
-                    }
-
-                    if (totalReplayed >= maxBatchSize)
-                    {
-                        break;
+                        TryDeleteFile(fileInfo.FullName);
                     }
                 }
 
@@ -196,27 +169,65 @@ namespace Logger.Internals
             }
         }
 
-        /// <summary>
-        /// 获取队列统计指标。
-        /// </summary>
         public static QueueMetrics GetMetrics()
         {
             lock (QueueLock)
             {
                 if (!Directory.Exists(QueueDir))
                 {
-                    return new QueueMetrics();
+                    return new QueueMetrics
+                    {
+                        ReplayFailureCount = Interlocked.Read(ref _replayFailureCount),
+                        SuccessfulReplayCount = Interlocked.Read(ref _successfulReplayCount),
+                        LastSuccessfulReplayUtc = ReadUtcTicks(ref _lastSuccessfulReplayUtcTicks),
+                        LastReplayAttemptUtc = ReadUtcTicks(ref _lastReplayAttemptUtcTicks)
+                    };
                 }
 
+                RecoverTempQueueFiles();
                 var files = Directory.GetFiles(QueueDir, "otlp-replay.*.jsonl", SearchOption.TopDirectoryOnly);
-                var totalBytes = files.Sum(f => new FileInfo(f).Length);
-                var totalLines = 0L;
+                var tempFiles = Directory.GetFiles(QueueDir, "otlp-replay.*.jsonl.*.tmp", SearchOption.TopDirectoryOnly);
+                var totalBytes = files.Sum(path => new FileInfo(path).Length);
+                long totalLines = 0;
+                long pendingConfirmationEntries = 0;
+                DateTime? latestQueuedAttemptUtc = null;
 
                 foreach (var file in files)
                 {
                     try
                     {
-                        totalLines += File.ReadLines(file, Encoding.UTF8).Count();
+                        foreach (var line in File.ReadLines(file, Encoding.UTF8))
+                        {
+                            if (string.IsNullOrWhiteSpace(line))
+                            {
+                                continue;
+                            }
+
+                            totalLines++;
+                            try
+                            {
+                                var entry = JsonSerializer.Deserialize<ReplayLogEntry>(line);
+                                if (entry?.AttemptCount > 0)
+                                {
+                                    pendingConfirmationEntries++;
+                                }
+
+                                if (entry?.LastAttemptUtc.HasValue == true)
+                                {
+                                    var attemptUtc = entry.LastAttemptUtc.Value.Kind == DateTimeKind.Utc
+                                        ? entry.LastAttemptUtc.Value
+                                        : entry.LastAttemptUtc.Value.ToUniversalTime();
+
+                                    if (!latestQueuedAttemptUtc.HasValue || attemptUtc > latestQueuedAttemptUtc.Value)
+                                    {
+                                        latestQueuedAttemptUtc = attemptUtc;
+                                    }
+                                }
+                            }
+                            catch
+                            {
+                            }
+                        }
                     }
                     catch
                     {
@@ -226,11 +237,449 @@ namespace Logger.Internals
                 return new QueueMetrics
                 {
                     FileCount = files.Length,
+                    TempFileCount = tempFiles.Length,
                     TotalBytes = totalBytes,
                     TotalEntries = totalLines,
-                    ReplayFailureCount = Interlocked.Read(ref _replayFailureCount)
+                    PendingConfirmationEntries = pendingConfirmationEntries,
+                    ReplayFailureCount = Interlocked.Read(ref _replayFailureCount),
+                    SuccessfulReplayCount = Interlocked.Read(ref _successfulReplayCount),
+                    LastSuccessfulReplayUtc = ReadUtcTicks(ref _lastSuccessfulReplayUtcTicks),
+                    LastReplayAttemptUtc = MaxUtc(ReadUtcTicks(ref _lastReplayAttemptUtcTicks), latestQueuedAttemptUtc)
                 };
             }
+        }
+
+        private static (int replayed, int failed, bool hasRemaining) ReplaySingleFile(string filePath, int maxBatch)
+        {
+            var replayed = 0;
+            var failed = 0;
+            var remainingLines = new List<string>();
+            try
+            {
+                foreach (var line in File.ReadLines(filePath, Encoding.UTF8))
+                {
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    if (replayed + failed >= maxBatch)
+                    {
+                        remainingLines.Add(line);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var entry = JsonSerializer.Deserialize<ReplayLogEntry>(line);
+                        if (entry == null || string.IsNullOrWhiteSpace(entry.Message))
+                        {
+                            continue;
+                        }
+
+                        if (CanUseVerifiedReplayTransport() && TryVerifyBatchVisible(new[] { entry }))
+                        {
+                            MarkReplaySuccess();
+                            replayed++;
+                            continue;
+                        }
+
+                        if (entry.LastAttemptUtc.HasValue
+                            && DateTime.UtcNow - entry.LastAttemptUtc.Value.ToUniversalTime() < ReplayRetryCooldown)
+                        {
+                            remainingLines.Add(JsonSerializer.Serialize(entry));
+                            continue;
+                        }
+
+                        var useVerifiedReplayTransport = CanUseVerifiedReplayTransport();
+                        var replayedSuccessfully = useVerifiedReplayTransport
+                            ? TryReplayBatch(new[] { entry })
+                            : ReplayBatchToCurrentLogger(new[] { entry });
+
+                        if (replayedSuccessfully)
+                        {
+                            if (useVerifiedReplayTransport)
+                            {
+                                WriteReplayEventsToLocalLog(new[] { entry });
+                            }
+
+                            MarkReplaySuccess();
+                            replayed++;
+                        }
+                        else
+                        {
+                            failed++;
+                            MarkBatchForRetry(new[] { entry });
+                            remainingLines.Add(JsonSerializer.Serialize(entry));
+                        }
+                    }
+                    catch
+                    {
+                        failed++;
+                        remainingLines.Add(line);
+                    }
+                }
+            }
+            catch
+            {
+                failed++;
+                return (0, failed, true);
+            }
+
+            if (remainingLines.Count > 0)
+            {
+                RewriteQueueFileWithRemaining(filePath, remainingLines);
+                return (replayed, failed, true);
+            }
+
+            return (replayed, failed, false);
+        }
+
+        private static bool TryReplayBatch(IReadOnlyList<ReplayLogEntry> batchEntries)
+        {
+            if (batchEntries.Count == 0 || string.IsNullOrWhiteSpace(_otlpLogsEndpoint) || _getOtlpFailureVersion == null)
+            {
+                return false;
+            }
+
+            var pendingEntries = GetEntriesPendingReplay(batchEntries);
+            if (pendingEntries.Count == 0)
+            {
+                return true;
+            }
+
+            var beforeFailureVersion = _getOtlpFailureVersion();
+            try
+            {
+                foreach (var entry in pendingEntries)
+                {
+                    Log.Write(BuildReplayLogEvent(entry, localOnly: false));
+                }
+
+                Thread.Sleep(1500);
+
+                if (_getOtlpFailureVersion() != beforeFailureVersion)
+                {
+                    return false;
+                }
+
+                return TryVerifyBatchVisible(batchEntries);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool CanUseVerifiedReplayTransport()
+        {
+            return !string.IsNullOrWhiteSpace(_otlpLogsEndpoint) && _getOtlpFailureVersion != null;
+        }
+
+        private static bool ReplayBatchToCurrentLogger(IReadOnlyList<ReplayLogEntry> batchEntries)
+        {
+            try
+            {
+                foreach (var entry in batchEntries)
+                {
+                    Log.Write(BuildReplayLogEvent(entry, localOnly: false));
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void WriteReplayEventsToLocalLog(IReadOnlyList<ReplayLogEntry> batchEntries)
+        {
+            foreach (var entry in batchEntries)
+            {
+                try
+                {
+                    Log.Write(BuildReplayLogEvent(entry, localOnly: true));
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static bool TryVerifyBatchVisible(IReadOnlyList<ReplayLogEntry> batchEntries)
+        {
+            if (batchEntries.Count == 0)
+            {
+                return true;
+            }
+
+            if (!TryBuildOpenObserveSearchUri(out var searchUri))
+            {
+                return true;
+            }
+
+            var replayIds = batchEntries
+                .Select(GetReplayId)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (replayIds.Length == 0)
+            {
+                return true;
+            }
+
+            var minTimestamp = batchEntries.Min(entry => entry.TimestampUtc.Kind == DateTimeKind.Utc
+                ? entry.TimestampUtc
+                : DateTime.SpecifyKind(entry.TimestampUtc, DateTimeKind.Utc));
+            var startTime = new DateTimeOffset(minTimestamp.AddMinutes(-10)).ToUnixTimeMilliseconds() * 1000;
+            var endTime = DateTimeOffset.UtcNow.AddMinutes(1).ToUnixTimeMilliseconds() * 1000;
+            var replayIdList = string.Join(", ", replayIds.Select(id => $"'{id}'"));
+            var sql = $"select count(distinct eventid) as c from \"default\" where eventid in ({replayIdList})";
+
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            if (TryBuildAuthorizationHeader(out var authorizationHeader))
+            {
+                client.DefaultRequestHeaders.Authorization = authorizationHeader;
+            }
+
+            for (var attempt = 0; attempt < 10; attempt++)
+            {
+                try
+                {
+                    var payload = JsonSerializer.Serialize(new
+                    {
+                        query = new
+                        {
+                            sql,
+                            start_time = startTime,
+                            end_time = endTime,
+                            from = 0,
+                            size = 10
+                        }
+                    });
+
+                    using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                    using var response = client.PostAsync(searchUri, content).GetAwaiter().GetResult();
+                    if (response.IsSuccessStatusCode)
+                    {
+                        using var stream = response.Content.ReadAsStream();
+                        using var document = JsonDocument.Parse(stream);
+                        if (document.RootElement.TryGetProperty("hits", out var hits)
+                            && hits.ValueKind == JsonValueKind.Array
+                            && hits.GetArrayLength() > 0)
+                        {
+                            var first = hits[0];
+                            if (first.TryGetProperty("c", out var countElement) && countElement.GetInt32() >= replayIds.Length)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                }
+
+                Thread.Sleep(500);
+            }
+
+            return false;
+        }
+
+        private static List<ReplayLogEntry> GetEntriesPendingReplay(IReadOnlyList<ReplayLogEntry> batchEntries)
+        {
+            try
+            {
+                var visibleIds = TryGetVisibleReplayIds(batchEntries);
+                if (visibleIds.Count == 0)
+                {
+                    return batchEntries.ToList();
+                }
+
+                return batchEntries
+                    .Where(entry => !visibleIds.Contains(GetReplayId(entry)))
+                    .ToList();
+            }
+            catch
+            {
+                return batchEntries.ToList();
+            }
+        }
+
+        private static HashSet<string> TryGetVisibleReplayIds(IReadOnlyList<ReplayLogEntry> batchEntries)
+        {
+            var replayIds = batchEntries
+                .Select(GetReplayId)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (replayIds.Length == 0)
+            {
+                return result;
+            }
+
+            if (!TryBuildOpenObserveSearchUri(out var searchUri))
+            {
+                return result;
+            }
+
+            var minTimestamp = batchEntries.Min(entry => entry.TimestampUtc.Kind == DateTimeKind.Utc
+                ? entry.TimestampUtc
+                : DateTime.SpecifyKind(entry.TimestampUtc, DateTimeKind.Utc));
+            var startTime = new DateTimeOffset(minTimestamp.AddMinutes(-10)).ToUnixTimeMilliseconds() * 1000;
+            var endTime = DateTimeOffset.UtcNow.AddMinutes(1).ToUnixTimeMilliseconds() * 1000;
+            var replayIdList = string.Join(", ", replayIds.Select(id => $"'{id}'"));
+            var sql = $"select eventid from \"default\" where eventid in ({replayIdList}) group by eventid limit {replayIds.Length}";
+
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            if (TryBuildAuthorizationHeader(out var authorizationHeader))
+            {
+                client.DefaultRequestHeaders.Authorization = authorizationHeader;
+            }
+
+            var payload = JsonSerializer.Serialize(new
+            {
+                query = new
+                {
+                    sql,
+                    start_time = startTime,
+                    end_time = endTime,
+                    from = 0,
+                    size = replayIds.Length
+                }
+            });
+
+            using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            using var response = client.PostAsync(searchUri, content).GetAwaiter().GetResult();
+            if (!response.IsSuccessStatusCode)
+            {
+                return result;
+            }
+
+            using var stream = response.Content.ReadAsStream();
+            using var document = JsonDocument.Parse(stream);
+            if (!document.RootElement.TryGetProperty("hits", out var hits) || hits.ValueKind != JsonValueKind.Array)
+            {
+                return result;
+            }
+
+            foreach (var hit in hits.EnumerateArray())
+            {
+                if (hit.TryGetProperty("eventid", out var replayIdElement))
+                {
+                    var replayId = replayIdElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(replayId))
+                    {
+                        result.Add(replayId);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static LogEvent BuildReplayLogEvent(ReplayLogEntry entry, bool localOnly)
+        {
+            var ts = entry.TimestampUtc.Kind == DateTimeKind.Utc
+                ? entry.TimestampUtc
+                : DateTime.SpecifyKind(entry.TimestampUtc, DateTimeKind.Utc);
+            var timestamp = new DateTimeOffset(ts);
+            var properties = new List<LogEventProperty>
+            {
+                new("ReplayQueue", new ScalarValue(true)),
+                new("ReplayTimestampUtc", new ScalarValue(entry.TimestampUtc)),
+                new("Message", new ScalarValue(entry.Message)),
+                new("EventId", new ScalarValue(GetReplayId(entry))),
+                new("ReplayId", new ScalarValue(GetReplayId(entry))),
+            };
+
+            if (localOnly)
+            {
+                properties.Add(new LogEventProperty("ReplayLocalOnly", new ScalarValue(true)));
+            }
+
+            MessageTemplate template;
+            if (!string.IsNullOrWhiteSpace(entry.Exception))
+            {
+                properties.Add(new LogEventProperty("ReplayException", new ScalarValue(entry.Exception)));
+                template = ReplayWithExTemplate;
+            }
+            else
+            {
+                template = ReplayTemplate;
+            }
+
+            return new LogEvent(timestamp, ParseSerilogLevel(entry.Level), null, template, properties);
+        }
+
+        private static Dictionary<string, string> ParseHeaders(string headers)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var segment in headers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var separatorIndex = segment.IndexOf('=');
+                if (separatorIndex <= 0 || separatorIndex == segment.Length - 1)
+                {
+                    continue;
+                }
+
+                var key = segment[..separatorIndex].Trim();
+                var value = segment[(separatorIndex + 1)..].Trim();
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    result[key] = value;
+                }
+            }
+
+            return result;
+        }
+
+        private static bool TryBuildAuthorizationHeader(out AuthenticationHeaderValue? headerValue)
+        {
+            headerValue = null;
+            if (string.IsNullOrWhiteSpace(_otlpHeaders))
+            {
+                return false;
+            }
+
+            var headers = ParseHeaders(_otlpHeaders);
+            if (!headers.TryGetValue("Authorization", out var rawAuthorization) || string.IsNullOrWhiteSpace(rawAuthorization))
+            {
+                return false;
+            }
+
+            var parts = rawAuthorization.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length != 2)
+            {
+                return false;
+            }
+
+            headerValue = new AuthenticationHeaderValue(parts[0], parts[1]);
+            return true;
+        }
+
+        private static bool TryBuildOpenObserveSearchUri(out Uri? searchUri)
+        {
+            searchUri = null;
+            if (!Uri.TryCreate(_otlpLogsEndpoint, UriKind.Absolute, out var logsUri))
+            {
+                return false;
+            }
+
+            var segments = logsUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length < 4 || !string.Equals(segments[0], "api", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var orgId = segments[1];
+            var builder = new UriBuilder(logsUri.Scheme, logsUri.Host, logsUri.Port, $"/api/{orgId}/_search")
+            {
+                Query = "is_ui_histogram=false&is_multi_stream_search=false&validate=false"
+            };
+
+            searchUri = builder.Uri;
+            return true;
         }
 
         private static string GetOrCreateCurrentFile()
@@ -258,15 +707,13 @@ namespace Logger.Internals
         {
             try
             {
+                RecoverTempQueueFiles();
                 var cutoff = DateTime.UtcNow.AddHours(-_maxAgeHours);
-                var files = Directory.GetFiles(QueueDir, "otlp-replay.*.jsonl", SearchOption.TopDirectoryOnly);
-
-                foreach (var file in files)
+                foreach (var file in Directory.GetFiles(QueueDir, "otlp-replay.*.jsonl", SearchOption.TopDirectoryOnly))
                 {
-                    var fileInfo = new FileInfo(file);
-                    if (fileInfo.CreationTimeUtc < cutoff)
+                    if (new FileInfo(file).CreationTimeUtc < cutoff)
                     {
-                        File.Delete(file);
+                        TryDeleteFile(file);
                         LogFallbackNotice($"已删除超龄补传队列文件: {Path.GetFileName(file)}");
                     }
                 }
@@ -280,12 +727,13 @@ namespace Logger.Internals
         {
             try
             {
+                RecoverTempQueueFiles();
                 var files = Directory.GetFiles(QueueDir, "otlp-replay.*.jsonl", SearchOption.TopDirectoryOnly)
-                    .Select(f => new FileInfo(f))
-                    .OrderBy(f => f.CreationTimeUtc)
+                    .Select(path => new FileInfo(path))
+                    .OrderBy(info => info.CreationTimeUtc)
                     .ToList();
 
-                var totalSize = files.Sum(f => f.Length);
+                var totalSize = files.Sum(info => info.Length);
                 if (totalSize <= _maxTotalSizeBytes)
                 {
                     return true;
@@ -299,15 +747,14 @@ namespace Logger.Internals
 
                 if (_overflowStrategy == OverflowStrategy.WarnOnly)
                 {
-                    LogFallbackNotice("补传队列超过容量上限（WarnOnly），继续保留全部队列文件");
+                    LogFallbackNotice("补传队列超过容量上限，继续保留全部队列文件");
                     return true;
                 }
 
-                // 溢出策略：删除最旧文件直到总大小低于上限
                 var deleted = 0;
                 foreach (var file in files)
                 {
-                    File.Delete(file.FullName);
+                    TryDeleteFile(file.FullName);
                     totalSize -= file.Length;
                     deleted++;
                     if (totalSize <= _maxTotalSizeBytes)
@@ -329,95 +776,156 @@ namespace Logger.Internals
             }
         }
 
-        private enum OverflowStrategy
+        private static void RewriteQueueFileWithRemaining(string filePath, List<string> remainingLines)
         {
-            DropOldest,
-            RejectNew,
-            WarnOnly
-        }
-
-        private static (int replayed, int failed) ReplaySingleFile(string filePath, int maxBatch)
-        {
-            var replayed = 0;
-            var failed = 0;
-
+            var tempPath = $"{filePath}.{Guid.NewGuid():N}.tmp";
+            File.WriteAllLines(tempPath, remainingLines, Encoding.UTF8);
             try
             {
-                var lines = File.ReadAllLines(filePath, Encoding.UTF8);
-                foreach (var line in lines)
+                File.Copy(tempPath, filePath, true);
+            }
+            finally
+            {
+                TryDeleteFile(tempPath);
+            }
+        }
+
+        private static void RecoverTempQueueFiles()
+        {
+            foreach (var tempPath in Directory.GetFiles(QueueDir, "otlp-replay.*.jsonl.*.tmp", SearchOption.TopDirectoryOnly))
+            {
+                try
                 {
-                    if (string.IsNullOrWhiteSpace(line))
+                    var markerIndex = tempPath.IndexOf(".jsonl.", StringComparison.OrdinalIgnoreCase);
+                    if (markerIndex < 0)
                     {
                         continue;
                     }
 
-                    try
-                    {
-                        var entry = JsonSerializer.Deserialize<ReplayLogEntry>(line);
-                        if (entry == null || string.IsNullOrWhiteSpace(entry.Message))
-                        {
-                            continue;
-                        }
+                    var queuePath = tempPath[..(markerIndex + ".jsonl".Length)];
+                    File.Copy(tempPath, queuePath, true);
+                    TryDeleteFile(tempPath);
+                }
+                catch
+                {
+                }
+            }
+        }
 
-                        var level = ParseSerilogLevel(entry.Level);
-
-                        // 步骤1：将 DateTime 转为 DateTimeOffset，确保 Kind=Utc。
-                        // 为什么：JSON 反序列化后 Kind 可能为 Unspecified，直接构造 DateTimeOffset 会偏移到本地时区。
-                        // 风险点：Enqueue 端已保存 DateTime.UtcNow，这里强制 Utc 是安全的。
-                        var ts = entry.TimestampUtc.Kind == DateTimeKind.Utc
-                            ? entry.TimestampUtc
-                            : DateTime.SpecifyKind(entry.TimestampUtc, DateTimeKind.Utc);
-                        var timestamp = new DateTimeOffset(ts);
-
-                        var properties = new List<LogEventProperty>
-                        {
-                            new("ReplayQueue", new ScalarValue(true)),
-                            new("ReplayTimestampUtc", new ScalarValue(entry.TimestampUtc)),
-                            new("Message", new ScalarValue(entry.Message))
-                        };
-
-                        MessageTemplate template;
-                        if (!string.IsNullOrWhiteSpace(entry.Exception))
-                        {
-                            properties.Add(new LogEventProperty("ReplayException", new ScalarValue(entry.Exception)));
-                            template = _replayWithExTemplate;
-                        }
-                        else
-                        {
-                            template = _replayTemplate;
-                        }
-
-                        // 步骤2：用原始时间戳构造 LogEvent，OTLP Sink 按此时间导出。
-                        // 为什么：Log.Write(level, template, args) 总是使用 DateTimeOffset.Now，补传日志会全部堆叠到当前时刻。
-                        // 风险点：MessageTemplate 占位符必须与 properties 名称一一对应，否则渲染为空。
-                        var logEvent = new LogEvent(timestamp, level, null, template, properties);
-                        Log.Write(logEvent);
-
-                        replayed++;
-                        if (replayed >= maxBatch)
-                        {
-                            break;
-                        }
-                    }
-                    catch
-                    {
-                        failed++;
-                    }
+        private static void TryDeleteFile(string filePath)
+        {
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
                 }
             }
             catch
             {
-                failed = 1;
             }
-
-            return (replayed, failed);
         }
 
         private static LogEventLevel ParseSerilogLevel(string? level)
         {
-            return Enum.TryParse<LogEventLevel>(level, true, out var parsed)
+            return Enum.TryParse(level, true, out LogEventLevel parsed)
                 ? parsed
                 : LogEventLevel.Information;
+        }
+
+        private static bool TryRememberRecentEnqueueId(string replayId)
+        {
+            if (string.IsNullOrWhiteSpace(replayId))
+            {
+                return true;
+            }
+
+            if (!RecentEnqueueIdSet.Add(replayId))
+            {
+                return false;
+            }
+
+            RecentEnqueueIds.Enqueue(replayId);
+            while (RecentEnqueueIds.Count > RecentEnqueueIdLimit)
+            {
+                var removed = RecentEnqueueIds.Dequeue();
+                RecentEnqueueIdSet.Remove(removed);
+            }
+
+            return true;
+        }
+
+        private static void MarkBatchForRetry(IEnumerable<ReplayLogEntry> entries)
+        {
+            var attemptedAt = DateTime.UtcNow;
+            WriteUtcTicks(ref _lastReplayAttemptUtcTicks, attemptedAt);
+            foreach (var entry in entries)
+            {
+                entry.AttemptCount++;
+                entry.LastAttemptUtc = attemptedAt;
+            }
+        }
+
+        private static void MarkReplaySuccess()
+        {
+            Interlocked.Increment(ref _successfulReplayCount);
+            WriteUtcTicks(ref _lastSuccessfulReplayUtcTicks, DateTime.UtcNow);
+        }
+
+        private static void WriteUtcTicks(ref long targetTicks, DateTime utcTime)
+        {
+            var normalized = utcTime.Kind == DateTimeKind.Utc ? utcTime : utcTime.ToUniversalTime();
+            Interlocked.Exchange(ref targetTicks, normalized.Ticks);
+        }
+
+        private static DateTime? ReadUtcTicks(ref long sourceTicks)
+        {
+            var ticks = Interlocked.Read(ref sourceTicks);
+            return ticks > 0 ? new DateTime(ticks, DateTimeKind.Utc) : null;
+        }
+
+        private static DateTime? MaxUtc(DateTime? left, DateTime? right)
+        {
+            if (!left.HasValue)
+            {
+                return right;
+            }
+
+            if (!right.HasValue)
+            {
+                return left;
+            }
+
+            return left.Value >= right.Value ? left : right;
+        }
+
+        private static string GetReplayId(ReplayLogEntry entry)
+        {
+            if (!string.IsNullOrWhiteSpace(entry.ReplayId))
+            {
+                return entry.ReplayId;
+            }
+
+            entry.ReplayId = ComputeEventId(
+                entry.TimestampUtc,
+                entry.Level ?? string.Empty,
+                entry.Message ?? string.Empty,
+                entry.Exception);
+            return entry.ReplayId;
+        }
+
+        private static string ComputeEventId(DateTime timestampUtc, string level, string message, string? exception)
+        {
+            var normalizedTimestamp = timestampUtc.Kind == DateTimeKind.Utc
+                ? timestampUtc
+                : timestampUtc.ToUniversalTime();
+            var seed = string.Join("|",
+                normalizedTimestamp.ToString("O"),
+                level,
+                message,
+                exception ?? string.Empty);
+            var hash = SHA256.HashData(Encoding.UTF8.GetBytes(seed));
+            return Convert.ToHexString(hash).ToLowerInvariant();
         }
 
         private static void LogFallbackNotice(string message)
@@ -425,7 +933,8 @@ namespace Logger.Internals
             try
             {
                 var fallbackPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs", "fallback.log");
-                File.AppendAllText(fallbackPath,
+                File.AppendAllText(
+                    fallbackPath,
                     $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [Logger] {message}{Environment.NewLine}",
                     Encoding.UTF8);
             }
@@ -434,20 +943,35 @@ namespace Logger.Internals
             }
         }
 
+        private enum OverflowStrategy
+        {
+            DropOldest,
+            RejectNew,
+            WarnOnly
+        }
+
         internal sealed class ReplayLogEntry
         {
             public DateTime TimestampUtc { get; set; }
             public string? Level { get; set; }
             public string? Message { get; set; }
             public string? Exception { get; set; }
+            public string? ReplayId { get; set; }
+            public int AttemptCount { get; set; }
+            public DateTime? LastAttemptUtc { get; set; }
         }
 
         public sealed class QueueMetrics
         {
             public int FileCount { get; set; }
+            public int TempFileCount { get; set; }
             public long TotalBytes { get; set; }
             public long TotalEntries { get; set; }
+            public long PendingConfirmationEntries { get; set; }
             public long ReplayFailureCount { get; set; }
+            public long SuccessfulReplayCount { get; set; }
+            public DateTime? LastSuccessfulReplayUtc { get; set; }
+            public DateTime? LastReplayAttemptUtc { get; set; }
         }
     }
 }
