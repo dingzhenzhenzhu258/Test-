@@ -1,118 +1,91 @@
-﻿using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
 using Logger.Helpers;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net;
-using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace Logger.Extensions.WebAPI
 {
-    /*
-     var app = builder.Build();
-
-        // ==========================================
-        // 1. 最外层：全局异常捕获（兜底防线，拦截 500 错误并转换格式）
-        app.UseGlobalExceptionHandler();
-
-        // 2. 第二层：输入输出数据包记录（这样即使后面报错了，这里也能完整记录发了什么，返回了什么 500 信息）
-        app.UseRequestResponseLogging();
-        // ==========================================
-
-        if (app.Environment.IsDevelopment())
-        {
-            app.UseSwagger();
-            app.UseSwaggerUI();
-        }
-
-        app.UseHttpsRedirection();
-        app.UseAuthorization();
-        app.MapControllers();
-
-        app.Run();
-     */
-
     /// <summary>
     /// WebAPI 全局异常中间件。
-    /// 统一捕获未处理异常并返回标准化 JSON 响应，
-    /// 同时将异常写入统一日志管道。
+    /// 统一捕获未处理异常并返回标准化 JSON 响应，同时将异常写入统一日志管道。
     /// </summary>
     public class GlobalExceptionMiddleware
     {
-        /// <summary>
-        /// 下一个中间件委托。
-        /// </summary>
         private readonly RequestDelegate _next;
-
-        /// <summary>
-        /// 当前中间件日志实例。
-        /// </summary>
         private readonly ILogger<GlobalExceptionMiddleware> _logger;
+        private readonly IConfiguration _configuration;
+        private readonly IHostEnvironment? _hostEnvironment;
 
-        /// <summary>
-        /// 创建全局异常中间件。
-        /// </summary>
-        public GlobalExceptionMiddleware(RequestDelegate next, ILogger<GlobalExceptionMiddleware> logger)
+        public GlobalExceptionMiddleware(
+            RequestDelegate next,
+            ILogger<GlobalExceptionMiddleware> logger,
+            IConfiguration configuration,
+            IHostEnvironment? hostEnvironment = null)
         {
             _next = next;
             _logger = logger;
+            _configuration = configuration;
+            _hostEnvironment = hostEnvironment;
         }
 
-        /// <summary>
-        /// 中间件入口。
-        /// </summary>
         public async Task InvokeAsync(HttpContext context)
         {
             try
             {
-                // 放行请求，让后续的 Controller 处理
-                await _next(context);
+                await _next(context).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                // 一旦后续有任何没有 try-catch 的报错，全都会掉进这里
-                // 记录错误（Serilog 会自动带着行号和方法名把它推送到云端）
-                _logger.AddLog(LogLevel.Error, string.Concat("WebAPI 发生未处理的全局异常: ", ex.Message), exception: ex);
+                _logger.AddLog(
+                    LogLevel.Error,
+                    string.Concat("WebAPI 发生未处理的全局异常: ", ex.Message),
+                    exception: ex);
 
-                // 统一处理给前端的返回格式
-                await HandleExceptionAsync(context, ex);
+                await HandleExceptionAsync(context, ex, ShouldIncludeExceptionDetail()).ConfigureAwait(false);
             }
         }
 
-        /// <summary>
-        /// 写入标准错误响应。
-        /// </summary>
-        private static Task HandleExceptionAsync(HttpContext context, Exception exception)
+        private static Task HandleExceptionAsync(HttpContext context, Exception exception, bool includeExceptionDetail)
         {
             context.Response.ContentType = "application/json";
-            context.Response.StatusCode = (int)HttpStatusCode.InternalServerError; // 强制返回 500 状态码
+            context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
 
-            // 构造标准化的返回 JSON
-            var response = new
-            {
-                StatusCode = context.Response.StatusCode,
-                Message = "服务器内部发生错误，请稍后重试或联系管理员。",
-                // 提示：生产环境下最好把下面这行注释掉，避免暴露底层代码细节给外部用户
-                ErrorDetail = exception.Message
-            };
+            object response = includeExceptionDetail
+                ? new
+                {
+                    StatusCode = context.Response.StatusCode,
+                    Message = "服务器内部发生错误，请稍后重试或联系管理员。",
+                    ErrorDetail = exception.Message
+                }
+                : new
+                {
+                    StatusCode = context.Response.StatusCode,
+                    Message = "服务器内部发生错误，请稍后重试或联系管理员。"
+                };
 
             return context.Response.WriteAsync(JsonSerializer.Serialize(response));
         }
+
+        private bool ShouldIncludeExceptionDetail()
+        {
+            var configured = _configuration["Logger:WebApi:IncludeExceptionDetails"];
+            if (bool.TryParse(configured, out var includeExceptionDetail))
+            {
+                return includeExceptionDetail;
+            }
+
+            return _hostEnvironment?.IsDevelopment() == true;
+        }
     }
 
-    /// <summary>
-    /// 全局异常中间件扩展。
-    /// 用于以扩展方法方式注册 <see cref="GlobalExceptionMiddleware"/>。
-    /// </summary>
     public static class GlobalExceptionMiddlewareExtensions
     {
-        /// <summary>
-        /// 启用全局异常处理中间件。
-        /// </summary>
         public static IApplicationBuilder UseGlobalExceptionHandler(this IApplicationBuilder builder)
         {
             return builder.UseMiddleware<GlobalExceptionMiddleware>();

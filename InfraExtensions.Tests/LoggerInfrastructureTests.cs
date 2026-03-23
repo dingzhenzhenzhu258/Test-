@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Text;
 using LoggerExtensionsHost = Logger.Extensions.LoggerExtensions;
 using Microsoft.Extensions.Configuration;
 using Serilog;
@@ -178,6 +179,26 @@ public sealed class LoggerInfrastructureTests : IDisposable
         var reachable = InvokePrivateStatic<bool>(typeof(LoggerExtensionsHost), "IsEndpointReachable", $"http://127.0.0.2:{unusedPort}/v1/logs", 100);
 
         Assert.False(reachable);
+    }
+
+    [Fact]
+    public void LoggerEmbeddedAppsettings_ShouldNotContainSerialPortServiceSection()
+    {
+        var assembly = typeof(LoggerExtensionsHost).Assembly;
+        var resourceName = assembly.GetManifestResourceNames()
+            .Single(x => x.EndsWith("appsettings.json", StringComparison.OrdinalIgnoreCase));
+
+        using var stream = assembly.GetManifestResourceStream(resourceName);
+        Assert.NotNull(stream);
+        using var reader = new StreamReader(stream!, Encoding.UTF8);
+        var json = reader.ReadToEnd();
+
+        var configuration = new ConfigurationBuilder()
+            .AddJsonStream(new MemoryStream(Encoding.UTF8.GetBytes(json)))
+            .Build();
+
+        Assert.True(configuration.GetSection("Logger").Exists());
+        Assert.False(configuration.GetSection("SerialPortService").Exists());
     }
 
     public void Dispose()
