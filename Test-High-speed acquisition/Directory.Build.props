@@ -1,0 +1,22 @@
+﻿<Project>
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(UseWPF)' == 'true'">
+	  <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.3" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.3" />
+	  <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.3" />
+	  <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.3" />
+	  <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
+	  <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+	  <PackageReference Include="WPF-UI" Version="4.2.0" />
+	  <PackageReference Include="WPF-UI.Abstractions" Version="4.2.0" />
+	  <PackageReference Include="WPF-UI.DependencyInjection" Version="4.2.0" />
+	  <PackageReference Include="WPF-UI.Tray" Version="4.2.0" />
+    </ItemGroup>
+</Project>
